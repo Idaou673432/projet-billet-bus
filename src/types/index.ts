@@ -11,6 +11,9 @@ export interface UserAccount {
   assignedStation?: string; // Ex: "Gare Routière Sogoniko, Bamako"
   assignedCompanyId?: string; // Ex: "nour_transport"
   assignedCompanyName?: string;
+  badgeId?: string; // Ex: "CTRL-BKO-01"
+  devicePin?: string; // Ex: "1234"
+  shiftStatus?: 'on_duty' | 'break' | 'off_duty';
   createdAt?: string;
 }
 
@@ -132,8 +135,56 @@ export type PaymentProvider =
   | 'wave' 
   | 'moov_money' 
   | 'mtn_momo' 
+  | 'cinetpay'
+  | 'paydunya'
+  | 'kkiapay'
   | 'card' 
   | 'cash_counter';
+
+export interface PaymentTransaction {
+  id: string; // e.g. "TXN-AFW-94821"
+  bookingId: string;
+  pnr: string;
+  provider: PaymentProvider;
+  providerReference: string; // e.g. Wave Checkout ID, OM Webpay TransID, MTN RefId
+  amountXOF: number;
+  feeXOF: number;
+  totalDebitedXOF: number;
+  currency: Currency;
+  payerPhone?: string;
+  payerName?: string;
+  payerEmail?: string;
+  cardLast4?: string;
+  cardBrand?: 'visa' | 'mastercard' | 'gim_uemoa';
+  status: 'completed' | 'pending' | 'failed' | 'refunded';
+  createdAt: string;
+  verifiedAt?: string;
+  gatewayResponseCode?: string;
+  gatewayMode: 'sandbox' | 'live';
+  receiptNumber: string; // e.g. "REC-2026-XOF-4821"
+  paymentMethodDetails?: string;
+}
+
+export interface PaymentGatewaySettings {
+  activeEnvironment: 'sandbox' | 'live';
+  waveEnabled: boolean;
+  waveApiKey?: string;
+  orangeMoneyEnabled: boolean;
+  orangeMoneyMerchantKey?: string;
+  mtnMoMoEnabled: boolean;
+  mtnMoMoApiKey?: string;
+  moovEnabled: boolean;
+  cinetpayEnabled: boolean;
+  cinetpaySiteId?: string;
+  cinetpayApiKey?: string;
+  paydunyaEnabled: boolean;
+  paydunyaMasterKey?: string;
+  kkiapayEnabled: boolean;
+  kkiapayPublicKey?: string;
+  cardEnabled: boolean;
+  cashCounterEnabled: boolean;
+  transactionFeePayer: 'traveler' | 'company' | 'split';
+}
 
 export interface Booking {
   id: string;
@@ -153,6 +204,8 @@ export interface Booking {
   boardedByAgent?: string;
   verificationHash: string;
   notes?: string;
+  transactionId?: string;
+  paymentReceiptNumber?: string;
 }
 
 export interface BrandConfig {

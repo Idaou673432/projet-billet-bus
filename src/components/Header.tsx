@@ -1,6 +1,6 @@
 import React from 'react';
 import { UserRole, Language, Currency, UserAccount } from '../types';
-import { User, ShieldCheck, Smartphone } from 'lucide-react';
+import { User, ShieldCheck, Smartphone, Download } from 'lucide-react';
 
 interface HeaderProps {
   brandName: string;
@@ -15,6 +15,8 @@ interface HeaderProps {
   setRole: (role: UserRole) => void;
   currentUser: UserAccount | null;
   onOpenAuth: () => void;
+  onOpenControllerAuth?: () => void;
+  onOpenInstall?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -24,6 +26,8 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenMyTickets,
   currentUser,
   onOpenAuth,
+  onOpenControllerAuth,
+  onOpenInstall,
 }) => {
   return (
     <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200">
@@ -98,17 +102,27 @@ export const Header: React.FC<HeaderProps> = ({
               <span>Cloud Sync</span>
             </div>
 
-            {/* If user is a Controller, give direct quick phone terminal button */}
-            {currentUser?.role === 'controller' && (
-              <button
-                onClick={() => setActiveTab('scanner')}
-                className="px-2.5 py-1.5 text-xs font-bold text-amber-950 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
-                title="Accéder au terminal de scan mobile"
-              >
-                <Smartphone className="w-3.5 h-3.5 text-amber-700" />
-                <span className="hidden sm:inline">Scanner Mobile</span>
-              </button>
-            )}
+            {/* Dedicated Controller Terminal Access Button */}
+            <button
+              onClick={() => {
+                if (onOpenControllerAuth) {
+                  onOpenControllerAuth();
+                } else {
+                  onOpenAuth();
+                }
+              }}
+              className={`px-2.5 py-1.5 text-xs font-bold rounded-lg flex items-center gap-1.5 transition-all cursor-pointer border ${
+                currentUser?.role === 'controller'
+                  ? 'bg-amber-500 hover:bg-amber-600 text-white border-amber-600 shadow-xs'
+                  : 'bg-amber-50 hover:bg-amber-100 text-amber-950 border-amber-300'
+              }`}
+              title="Espace Authenticator Contrôleur : Scanner mobile des billets sur le quai"
+            >
+              <Smartphone className={`w-3.5 h-3.5 ${currentUser?.role === 'controller' ? 'text-white' : 'text-amber-700'}`} />
+              <span className="font-extrabold">
+                {currentUser?.role === 'controller' ? 'Terminal Contrôle' : 'Accès Contrôleur'}
+              </span>
+            </button>
 
             <button
               onClick={onOpenMyTickets}
@@ -116,6 +130,17 @@ export const Header: React.FC<HeaderProps> = ({
             >
               Mes Billets
             </button>
+
+            {onOpenInstall && (
+              <button
+                onClick={onOpenInstall}
+                className="hidden md:flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:text-emerald-800 hover:bg-slate-100 rounded-lg transition-colors whitespace-nowrap cursor-pointer border border-slate-200"
+                title="Installer AFRIWAY sur smartphone (PWA Android / iOS)"
+              >
+                <Download className="w-3.5 h-3.5 text-emerald-600" />
+                <span>Installer App</span>
+              </button>
+            )}
 
             {/* Authenticator Account Button */}
             <button

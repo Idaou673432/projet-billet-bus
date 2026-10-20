@@ -3,6 +3,9 @@ import { Trip, Currency, Passenger, PaymentProvider, Booking } from '../types';
 import { formatPrice } from '../utils/currency';
 import { saveBooking } from '../utils/storage';
 import { saveBookingToCloud } from '../services/firestoreSync';
+import { PAYMENT_PROVIDERS_CATALOG } from '../services/paymentService';
+import { generateTicketSecuritySignature, sanitizeInput } from '../services/securityService';
+import { InteractivePaymentExecution } from './InteractivePaymentExecution';
 import confetti from 'canvas-confetti';
 import { 
   X, 
@@ -12,7 +15,12 @@ import {
   CreditCard, 
   AlertTriangle, 
   CheckCircle2, 
-  Loader2 
+  Loader2,
+  Building2,
+  Sparkles,
+  Printer,
+  Receipt,
+  FileText
 } from 'lucide-react';
 
 interface PassengerCheckoutModalProps {
@@ -45,13 +53,23 @@ export const PassengerCheckoutModal: React.FC<PassengerCheckoutModalProps> = ({
     }))
   );
 
-  const [paymentProvider, setPaymentProvider] = useState<PaymentProvider>('orange_money');
+  const [paymentCategory, setPaymentCategory] = useState<'all' | 'mobile_money' | 'aggregator' | 'card' | 'cash'>('all');
+  const [paymentProvider, setPaymentProvider] = useState<PaymentProvider>('wave');
   const [payerPhone, setPayerPhone] = useState<string>('+223 76 12 34 56');
-  const [isProcessing, setIsProcessing] = useState<boolean>(false);
-  const [paymentStep, setPaymentStep] = useState<'form' | 'push_prompt' | 'completed'>('form');
-  const [countdown, setCountdown] = useState<number>(5);
+  const [paymentStep, setPaymentStep] = useState<'form' | 'authorization' | 'completed'>('form');
+  
+  // PNR generated when initiating checkout
+  const [activePnr, setActivePnr] = useState<string>(() => {
+    const randomSuffix = Math.floor(10000 + Math.random() * 90000);
+    const cityCode = trip.originCity.substring(0, 3).toUpperCase();
+    return `AFW-${randomSuffix}-${cityCode}`;
+  });
+
+  const [completedBooking, setCompletedBooking] = useState<Booking | null>(null);
 
   const totalAmountXOF = selectedSeats.length * trip.basePriceXOF;
+  const currentProviderMeta = PAYMENT_PROVIDERS_CATALOG[paymentProvider];
+  const feeXOF = Math.round((totalAmountXOF * currentProviderMeta.feePercent) / 100);
 
   const handlePassengerChange = (index: number, field: keyof Passenger, value: string) => {
     const updated = [...passengers];
@@ -70,73 +88,77 @@ export const PassengerCheckoutModal: React.FC<PassengerCheckoutModalProps> = ({
       }
     }
 
-    if (!payerPhone.trim()) {
-      alert('Veuillez renseigner un numéro de téléphone pour le paiement Mobile Money.');
+    if (paymentProvider !== 'card' && !payerPhone.trim()) {
+      alert('Veuillez renseigner un numéro de téléphone pour la réception du billet et le paiement.');
       return;
     }
 
-    // Move to simulated USSD / Push screen
-    setIsProcessing(true);
-    setPaymentStep('push_prompt');
-    setCountdown(5);
-
-    const timer = setInterval(() => {
-      setCountdown((prev) => {
-        if (prev <= 1) {
-          clearInterval(timer);
-          finishPayment();
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
+    // Advance to interactive payment execution
+    setPaymentStep('authorization');
   };
 
-  const finishPayment = () => {
-    setIsProcessing(false);
-    setPaymentStep('completed');
+  const handlePaymentSuccess = async (transaction: any) => {
+    const sanitizedPassengers = passengers.map((p) => ({
+      ...p,
+      firstName: sanitizeInput(p.firstName),
+      lastName: sanitizeInput(p.lastName),
+      idNumber: sanitizeInput(p.idNumber),
+      phone: sanitizeInput(p.phone),
+      nationality: sanitizeInput(p.nationality),
+    }));
 
-    // Create unique PNR
-    const randomSuffix = Math.floor(10000 + Math.random() * 90000);
-    const cityCode = trip.originCity.substring(0, 3).toUpperCase();
-    const pnr = `AFW-${randomSuffix}-${cityCode}`;
+    // Compute cryptographic HMAC-SHA256 digital signature
+    const signature = await generateTicketSecuritySignature({
+      pnr: activePnr,
+      tripId: trip.id,
+      departureDate: trip.departureDate,
+      seats: sanitizedPassengers.map((p) => p.seatNumber),
+      totalAmountXOF,
+      passengerLastName: sanitizedPassengers[0].lastName,
+    });
 
     const newBooking: Booking = {
       id: `booking_${Date.now()}`,
-      pnr,
+      pnr: activePnr,
       tripId: trip.id,
       trip,
-      passengers,
+      passengers: sanitizedPassengers,
       totalAmountXOF,
       currency,
       paymentProvider,
-      paymentPhone: payerPhone,
+      paymentPhone: sanitizeInput(payerPhone),
       paymentStatus: 'completed',
       bookingDate: new Date().toISOString(),
       boardingStatus: 'not_boarded',
-      verificationHash: `afriway_v_${randomSuffix}_${passengers[0].lastName.toLowerCase()}`,
-      notes: `Réservation confirmée via ${paymentProvider.toUpperCase()}. Présentez le QR Code en gare.`,
+      verificationHash: signature,
+      notes: `Paiement certifié via ${currentProviderMeta.name}. Signature: ${signature}.`,
+      transactionId: transaction.id,
+      paymentReceiptNumber: transaction.receiptNumber,
     };
 
     saveBooking(newBooking);
     saveBookingToCloud(newBooking).catch((err) => console.warn('Cloud sync error (local fallback preserved):', err));
 
+    setCompletedBooking(newBooking);
+    setPaymentStep('completed');
+
     // Confetti celebration
     try {
       confetti({
-        particleCount: 80,
-        spread: 70,
+        particleCount: 100,
+        spread: 75,
         origin: { y: 0.6 },
-        colors: ['#047857', '#d97706', '#059669', '#f59e0b'],
+        colors: ['#047857', '#0891b2', '#f59e0b', '#d97706'],
       });
     } catch {
       // ignore
     }
-
-    setTimeout(() => {
-      onBookingSuccess(newBooking);
-    }, 800);
   };
+
+  const providersList = Object.values(PAYMENT_PROVIDERS_CATALOG).filter((p) => {
+    if (paymentCategory === 'all') return true;
+    return p.category === paymentCategory;
+  });
 
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-950/75 backdrop-blur-sm flex items-center justify-center p-3 sm:p-5">
@@ -144,20 +166,33 @@ export const PassengerCheckoutModal: React.FC<PassengerCheckoutModalProps> = ({
         {/* Header */}
         <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50">
           <div className="flex items-center gap-2">
-            <button
-              onClick={onClose}
-              className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-200 transition-colors cursor-pointer mr-1"
-            >
-              <ArrowLeft className="w-5 h-5" />
-            </button>
+            {paymentStep === 'authorization' ? (
+              <button
+                onClick={() => setPaymentStep('form')}
+                className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-200 transition-colors cursor-pointer mr-1"
+              >
+                <ArrowLeft className="w-5 h-5" />
+              </button>
+            ) : (
+              <button
+                onClick={onClose}
+                className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-200 transition-colors cursor-pointer mr-1"
+              >
+                <ArrowLeft className="w-5 h-5" />
+              </button>
+            )}
             <div>
               <div className="flex items-center gap-1.5 text-xs text-slate-500">
                 <span>{trip.companyName}</span>
                 <span aria-hidden="true">·</span>
                 <span>Sièges : {selectedSeats.join(', ')}</span>
+                <span aria-hidden="true">·</span>
+                <span className="font-mono font-bold text-emerald-800">PNR : {activePnr}</span>
               </div>
               <h3 className="text-lg font-bold text-slate-900">
-                Finalisation de votre voyage & Paiement
+                {paymentStep === 'form' && 'Finalisation de votre voyage & Paiement'}
+                {paymentStep === 'authorization' && `Autorisation de Paiement — ${currentProviderMeta.name}`}
+                {paymentStep === 'completed' && 'Paiement Réussi & Billet Officiel Émis'}
               </h3>
             </div>
           </div>
@@ -169,7 +204,8 @@ export const PassengerCheckoutModal: React.FC<PassengerCheckoutModalProps> = ({
           </button>
         </div>
 
-        {paymentStep === 'form' ? (
+        {/* STEP 1: FORM WITH CATEGORIZED PAYMENT METHODS */}
+        {paymentStep === 'form' && (
           <form onSubmit={handleStartPayment} className="p-6 max-h-[75vh] overflow-y-auto space-y-6">
             {/* International Border Warning if cross-border */}
             {trip.isCrossBorder && (
@@ -282,103 +318,132 @@ export const PassengerCheckoutModal: React.FC<PassengerCheckoutModalProps> = ({
               ))}
             </div>
 
-            {/* Payment Method Selector */}
+            {/* Comprehensive Payment Providers Section */}
             <div className="space-y-3 pt-2">
-              <h4 className="text-sm font-bold uppercase tracking-wider text-slate-700">
-                Paiement Mobile Money & Carte
-              </h4>
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <h4 className="text-sm font-bold uppercase tracking-wider text-slate-700 flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-emerald-800" />
+                  <span>Moyens de Paiement Intégrés (Afrique de l'Ouest)</span>
+                </h4>
+                <span className="text-[11px] text-emerald-800 font-semibold bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-200 self-start">
+                  9 Passerelles Actives
+                </span>
+              </div>
 
+              {/* Filter Tabs by Category */}
+              <div className="flex flex-wrap gap-1.5 p-1 bg-slate-100 rounded-xl text-xs font-semibold">
+                <button
+                  type="button"
+                  onClick={() => setPaymentCategory('all')}
+                  className={`px-3 py-1.5 rounded-lg transition-colors cursor-pointer ${
+                    paymentCategory === 'all'
+                      ? 'bg-white text-emerald-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Tous (9)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPaymentCategory('mobile_money')}
+                  className={`px-3 py-1.5 rounded-lg transition-colors cursor-pointer ${
+                    paymentCategory === 'mobile_money'
+                      ? 'bg-white text-emerald-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  📱 Mobile Money (4)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPaymentCategory('aggregator')}
+                  className={`px-3 py-1.5 rounded-lg transition-colors cursor-pointer ${
+                    paymentCategory === 'aggregator'
+                      ? 'bg-white text-emerald-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  🌐 Agrégateurs (3)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPaymentCategory('card')}
+                  className={`px-3 py-1.5 rounded-lg transition-colors cursor-pointer ${
+                    paymentCategory === 'card'
+                      ? 'bg-white text-emerald-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  💳 Cartes UEMOA & Inter
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPaymentCategory('cash')}
+                  className={`px-3 py-1.5 rounded-lg transition-colors cursor-pointer ${
+                    paymentCategory === 'cash'
+                      ? 'bg-white text-emerald-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  🏢 Guichet Gare
+                </button>
+              </div>
+
+              {/* Payment Methods Grid */}
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
-                {/* Orange Money */}
-                <button
-                  type="button"
-                  onClick={() => setPaymentProvider('orange_money')}
-                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
-                    paymentProvider === 'orange_money'
-                      ? 'border-orange-500 bg-orange-50/70 ring-2 ring-orange-500/20'
-                      : 'border-slate-200 bg-white hover:bg-slate-50'
-                  }`}
-                >
-                  <div className="w-8 h-8 rounded-lg bg-orange-500 text-white font-black text-xs flex items-center justify-center mb-1.5 shadow-xs">
-                    OM
-                  </div>
-                  <span className="block text-xs font-bold text-slate-900">Orange Money</span>
-                  <span className="text-[10px] text-slate-500">Mali, Sénégal, CI (#144#)</span>
-                </button>
+                {providersList.map((prov) => {
+                  const isSelected = paymentProvider === prov.id;
+                  return (
+                    <button
+                      key={prov.id}
+                      type="button"
+                      onClick={() => setPaymentProvider(prov.id)}
+                      className={`p-3 rounded-2xl border text-left transition-all cursor-pointer relative ${
+                        isSelected
+                          ? `ring-2 ring-emerald-600 bg-emerald-50/50 border-emerald-500 shadow-sm`
+                          : 'border-slate-200 bg-white hover:bg-slate-50'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-1.5">
+                        <div
+                          className="w-8 h-8 rounded-lg text-white font-black text-xs flex items-center justify-center shadow-xs"
+                          style={{ backgroundColor: prov.color }}
+                        >
+                          {prov.id === 'wave' && 'W'}
+                          {prov.id === 'orange_money' && 'OM'}
+                          {prov.id === 'mtn_momo' && 'MTN'}
+                          {prov.id === 'moov_money' && 'Moov'}
+                          {prov.id === 'cinetpay' && 'CP'}
+                          {prov.id === 'paydunya' && 'PD'}
+                          {prov.id === 'kkiapay' && 'KK'}
+                          {prov.id === 'card' && <CreditCard className="w-4 h-4" />}
+                          {prov.id === 'cash_counter' && <Building2 className="w-4 h-4" />}
+                        </div>
+                        {isSelected && (
+                          <div className="w-4 h-4 rounded-full bg-emerald-800 text-white flex items-center justify-center text-[10px]">
+                            ✓
+                          </div>
+                        )}
+                      </div>
 
-                {/* Wave */}
-                <button
-                  type="button"
-                  onClick={() => setPaymentProvider('wave')}
-                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
-                    paymentProvider === 'wave'
-                      ? 'border-sky-500 bg-sky-50/70 ring-2 ring-sky-500/20'
-                      : 'border-slate-200 bg-white hover:bg-slate-50'
-                  }`}
-                >
-                  <div className="w-8 h-8 rounded-lg bg-sky-500 text-white font-black text-xs flex items-center justify-center mb-1.5 shadow-xs">
-                    W
-                  </div>
-                  <span className="block text-xs font-bold text-slate-900">Wave</span>
-                  <span className="text-[10px] text-slate-500">Sénégal, Côte d'Ivoire (1% frais)</span>
-                </button>
-
-                {/* Moov Money */}
-                <button
-                  type="button"
-                  onClick={() => setPaymentProvider('moov_money')}
-                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
-                    paymentProvider === 'moov_money'
-                      ? 'border-blue-600 bg-blue-50/70 ring-2 ring-blue-500/20'
-                      : 'border-slate-200 bg-white hover:bg-slate-50'
-                  }`}
-                >
-                  <div className="w-8 h-8 rounded-lg bg-blue-600 text-white font-black text-xs flex items-center justify-center mb-1.5 shadow-xs">
-                    Moov
-                  </div>
-                  <span className="block text-xs font-bold text-slate-900">Moov Money</span>
-                  <span className="text-[10px] text-slate-500">Mali, Burkina, Togo, Bénin</span>
-                </button>
-
-                {/* MTN Mobile Money */}
-                <button
-                  type="button"
-                  onClick={() => setPaymentProvider('mtn_momo')}
-                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
-                    paymentProvider === 'mtn_momo'
-                      ? 'border-yellow-500 bg-yellow-50/70 ring-2 ring-yellow-500/20'
-                      : 'border-slate-200 bg-white hover:bg-slate-50'
-                  }`}
-                >
-                  <div className="w-8 h-8 rounded-lg bg-yellow-500 text-slate-900 font-black text-xs flex items-center justify-center mb-1.5 shadow-xs">
-                    MTN
-                  </div>
-                  <span className="block text-xs font-bold text-slate-900">MTN MoMo</span>
-                  <span className="text-[10px] text-slate-500">Côte d'Ivoire, Bénin</span>
-                </button>
-
-                {/* Bank Card */}
-                <button
-                  type="button"
-                  onClick={() => setPaymentProvider('card')}
-                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
-                    paymentProvider === 'card'
-                      ? 'border-emerald-600 bg-emerald-50/70 ring-2 ring-emerald-500/20'
-                      : 'border-slate-200 bg-white hover:bg-slate-50'
-                  }`}
-                >
-                  <div className="w-8 h-8 rounded-lg bg-slate-900 text-white flex items-center justify-center mb-1.5 shadow-xs">
-                    <CreditCard className="w-4 h-4 text-emerald-400" />
-                  </div>
-                  <span className="block text-xs font-bold text-slate-900">Carte Visa / Mastercard</span>
-                  <span className="text-[10px] text-slate-500">Cartes UEMOA & Internationales</span>
-                </button>
+                      <span className="block text-xs font-bold text-slate-900 leading-tight">
+                        {prov.name}
+                      </span>
+                      <span className="text-[10px] text-slate-500 line-clamp-1 mt-0.5">
+                        {prov.tagline}
+                      </span>
+                      <div className="mt-1 text-[9px] font-semibold text-emerald-800 bg-emerald-100/60 px-1.5 py-0.5 rounded-sm inline-block">
+                        {prov.badge}
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
 
               {/* Payer Phone Field */}
               <div className="pt-2">
                 <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Numéro de débit Mobile Money / Réception du billet *
+                  Numéro de téléphone (Débit Mobile Money & Réception SMS Billet) *
                 </label>
                 <div className="relative">
                   <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-400">
@@ -394,7 +459,7 @@ export const PassengerCheckoutModal: React.FC<PassengerCheckoutModalProps> = ({
                   />
                 </div>
                 <p className="text-[11px] text-slate-500 mt-1">
-                  Vous recevrez un message de confirmation et votre lien vers le billet électronique QR Code.
+                  Vous recevrez la notification de paiement sécurisée et votre billet électronique QR Code par SMS/WhatsApp.
                 </p>
               </div>
             </div>
@@ -402,10 +467,17 @@ export const PassengerCheckoutModal: React.FC<PassengerCheckoutModalProps> = ({
             {/* Total and Submit */}
             <div className="pt-4 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
               <div>
-                <span className="text-xs text-slate-500 block">Montant total net :</span>
-                <span className="text-2xl font-black text-emerald-900 font-mono tabular-nums">
-                  {formatPrice(totalAmountXOF, currency)}
-                </span>
+                <span className="text-xs text-slate-500 block">Montant voyage net :</span>
+                <div className="flex items-baseline gap-2">
+                  <span className="text-2xl font-black text-emerald-900 font-mono tabular-nums">
+                    {formatPrice(totalAmountXOF, currency)}
+                  </span>
+                  {feeXOF > 0 && (
+                    <span className="text-xs text-slate-500 font-mono">
+                      (+{formatPrice(feeXOF, currency)} frais {currentProviderMeta.name})
+                    </span>
+                  )}
+                </div>
               </div>
 
               <button
@@ -413,74 +485,118 @@ export const PassengerCheckoutModal: React.FC<PassengerCheckoutModalProps> = ({
                 className="w-full sm:w-auto px-7 py-3 bg-emerald-800 hover:bg-emerald-900 text-white font-bold text-sm rounded-xl transition-all shadow-md active:scale-[0.98] cursor-pointer flex items-center justify-center gap-2"
               >
                 <ShieldCheck className="w-4 h-4" />
-                <span>Payer et émettre mon billet</span>
+                <span>Continuer vers le paiement {currentProviderMeta.name}</span>
               </button>
             </div>
           </form>
-        ) : paymentStep === 'push_prompt' ? (
-          /* Simulated USSD / Push Notification Screen */
-          <div className="p-8 text-center space-y-6">
-            <div className="w-16 h-16 rounded-full bg-emerald-100 text-emerald-800 flex items-center justify-center mx-auto">
-              <Loader2 className="w-8 h-8 animate-spin" />
-            </div>
+        )}
 
-            <div className="max-w-md mx-auto space-y-2">
-              <h3 className="text-xl font-bold text-slate-900">
-                Demande d'autorisation envoyée !
-              </h3>
-              <p className="text-sm text-slate-600 leading-relaxed">
-                Une notification de paiement de{' '}
-                <strong className="text-emerald-900 font-mono">
-                  {formatPrice(totalAmountXOF, currency)}
-                </strong>{' '}
-                a été envoyée sur votre téléphone{' '}
-                <strong className="font-mono text-slate-900">{payerPhone}</strong>.
-              </p>
-            </div>
+        {/* STEP 2: INTERACTIVE AUTHORIZATION STEP */}
+        {paymentStep === 'authorization' && (
+          <InteractivePaymentExecution
+            provider={paymentProvider}
+            totalAmountXOF={totalAmountXOF}
+            currency={currency}
+            payerPhone={payerPhone}
+            payerEmail={passengers[0]?.email}
+            passengerName={`${passengers[0]?.firstName} ${passengers[0]?.lastName}`}
+            pnr={activePnr}
+            bookingId={`booking_${Date.now()}`}
+            onPaymentSuccess={handlePaymentSuccess}
+            onCancel={() => setPaymentStep('form')}
+          />
+        )}
 
-            <div className="bg-slate-100 rounded-2xl p-4 max-w-md mx-auto border border-slate-200 text-xs text-slate-700 space-y-2 text-left">
-              <div className="flex items-center gap-2 font-bold text-slate-900">
-                <Smartphone className="w-4 h-4 text-emerald-700" />
-                <span>Instructions sur votre téléphone :</span>
-              </div>
-              {paymentProvider === 'orange_money' && (
-                <p>Composez le <strong>#144#</strong> ou ouvrez l'application <strong>Orange Money</strong>, saisissez votre code PIN secret pour approuver la transaction.</p>
-              )}
-              {paymentProvider === 'wave' && (
-                <p>Ouvrez votre application <strong>Wave</strong> et appuyez sur « Confirmer le paiement ».</p>
-              )}
-              {(paymentProvider === 'moov_money' || paymentProvider === 'mtn_momo') && (
-                <p>Confirmez le prompt USSD qui s'affiche sur votre écran avec votre code secret.</p>
-              )}
-              {paymentProvider === 'card' && (
-                <p>Authentification 3D-Secure en cours de validation par votre établissement bancaire.</p>
-              )}
-            </div>
-
-            <div className="text-xs text-slate-500 font-mono">
-              Validation automatique dans {countdown}s...
+        {/* STEP 3: COMPLETED OFFICIAL RECEIPT & TICKET ISSUANCE */}
+        {paymentStep === 'completed' && completedBooking && (
+          <div className="p-6 sm:p-8 space-y-6 text-center">
+            <div className="w-16 h-16 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center mx-auto shadow-sm">
+              <CheckCircle2 className="w-10 h-10" />
             </div>
 
             <div>
+              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-100 text-emerald-800 text-xs font-bold mb-2">
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Paiement Certifié & Billet Émis avec Succès</span>
+              </div>
+              <h3 className="text-2xl font-black text-slate-900">
+                Merci {passengers[0]?.firstName} ! Bon voyage.
+              </h3>
+              <p className="text-xs text-slate-600 mt-1 max-w-md mx-auto">
+                Votre transaction a été approuvée avec succès. Vos places sont officiellement réservées sur le car <strong>{trip.companyName}</strong>.
+              </p>
+            </div>
+
+            {/* Official Fiscal Receipt Card */}
+            <div className="bg-slate-50 border border-slate-200 rounded-2xl p-5 max-w-md mx-auto text-left space-y-3 font-mono text-xs shadow-xs">
+              <div className="flex items-center justify-between border-b border-slate-200 pb-2">
+                <div className="flex items-center gap-2">
+                  <Receipt className="w-4 h-4 text-emerald-700" />
+                  <span className="font-bold text-slate-900 uppercase">Quittance Officielle</span>
+                </div>
+                <span className="text-[10px] text-emerald-800 font-bold bg-emerald-100 px-2 py-0.5 rounded">
+                  00_SUCCESS
+                </span>
+              </div>
+
+              <div className="space-y-1 text-slate-600">
+                <div className="flex justify-between">
+                  <span>Numéro Reçu :</span>
+                  <span className="font-bold text-slate-900">{completedBooking.paymentReceiptNumber || 'REC-2026-AFW'}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Réf Dossier (PNR) :</span>
+                  <span className="font-bold text-emerald-800">{completedBooking.pnr}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>ID Transaction :</span>
+                  <span className="font-bold text-slate-900">{completedBooking.transactionId || 'TXN-AFW-OK'}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Passerelle / Opérateur :</span>
+                  <span className="font-bold text-slate-900">{currentProviderMeta.name}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Trajet :</span>
+                  <span className="font-bold text-slate-900">{trip.originCity} ➔ {trip.destinationCity}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Départ :</span>
+                  <span className="font-bold text-slate-900">{trip.departureDate} à {trip.departureTime}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Sièges réservés :</span>
+                  <span className="font-bold text-slate-900">{selectedSeats.join(', ')}</span>
+                </div>
+                <div className="flex justify-between border-t border-slate-200 pt-2 text-sm text-slate-900 font-bold">
+                  <span>Montant total payé :</span>
+                  <span className="text-emerald-900">{formatPrice(totalAmountXOF, currency)}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Actions */}
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
               <button
                 type="button"
-                onClick={finishPayment}
-                className="px-6 py-2.5 bg-emerald-800 hover:bg-emerald-900 text-white font-semibold text-xs rounded-xl shadow-sm transition-all cursor-pointer"
+                onClick={() => onBookingSuccess(completedBooking)}
+                className="w-full sm:w-auto px-6 py-3 bg-emerald-800 hover:bg-emerald-900 text-white font-bold text-xs rounded-xl shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
               >
-                Valider immédiatement (Accélérer démo)
+                <FileText className="w-4 h-4" />
+                <span>Afficher mon Billet & QR Code</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  onBookingSuccess(completedBooking);
+                }}
+                className="w-full sm:w-auto px-5 py-3 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-semibold text-xs rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <Printer className="w-4 h-4 text-emerald-800" />
+                <span>Télécharger la Quittance & PDF</span>
               </button>
             </div>
-          </div>
-        ) : (
-          /* Payment completed */
-          <div className="p-8 text-center space-y-4">
-            <div className="w-16 h-16 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center mx-auto">
-              <CheckCircle2 className="w-10 h-10" />
-            </div>
-            <h3 className="text-2xl font-black text-slate-900">Paiement Réussi !</h3>
-            <p className="text-sm text-slate-600">
-              Votre billet électronique avec QR code sécurisé est généré.
-            </p>
           </div>
         )}
       </div>

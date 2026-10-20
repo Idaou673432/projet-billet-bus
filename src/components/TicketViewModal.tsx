@@ -4,6 +4,7 @@ import { formatPrice } from '../utils/currency';
 import { generateTicketPDF } from '../utils/pdfGenerator';
 import { getCompanyById } from '../utils/storage';
 import { DEFAULT_COMPANY_LOGOS } from '../utils/companyLogos';
+import { PAYMENT_PROVIDERS_CATALOG } from '../services/paymentService';
 import QRCode from 'qrcode';
 import { 
   X, 
@@ -537,9 +538,15 @@ export const TicketViewModal: React.FC<TicketViewModalProps> = ({
                   <ShieldCheck className="w-5 h-5 text-emerald-800 shrink-0 mt-0.5" />
                   <div>
                     <span className="font-bold text-slate-900 block">Paiement & Contrôle Sécurisé</span>
-                    <span className="text-slate-600">
-                      Règlement validé de <strong>{formatPrice(booking.totalAmountXOF, currency)}</strong> via {booking.paymentProvider.toUpperCase()}.
+                    <span className="text-slate-600 block">
+                      Règlement certifié de <strong>{formatPrice(booking.totalAmountXOF, currency)}</strong> via {PAYMENT_PROVIDERS_CATALOG[booking.paymentProvider]?.name || booking.paymentProvider.toUpperCase()}.
                     </span>
+                    {(booking.transactionId || booking.paymentReceiptNumber) && (
+                      <span className="font-mono text-[10px] text-slate-500 block mt-0.5">
+                        {booking.transactionId && `TXN : ${booking.transactionId}`}
+                        {booking.paymentReceiptNumber && ` · Reçu : ${booking.paymentReceiptNumber}`}
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>

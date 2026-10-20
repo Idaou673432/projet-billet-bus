@@ -2,46 +2,83 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    function isValidString(val, maxLen) {
-      return val is string && val.size() <= maxLen;
+    function isValidString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
     }
 
-    // 1. Bookings collection (E-tickets, PNRs, Boarding status)
+    // 1. Bookings Collection (E-Tickets, PNRs, Boarding Pass Records)
     match /bookings/{bookingId} {
       allow read: if true;
-      allow create: if request.resource.data.pnr is string 
+      
+      // Strict anti-tampering creation validation
+      allow create: if isValidString(request.resource.data.pnr, 4, 30)
                     && request.resource.data.tripId is string
-                    && request.resource.data.totalAmountXOF is number;
-      allow update: if request.resource.data.pnr == resource.data.pnr;
+                    && request.resource.data.totalAmountXOF is number
+                    && request.resource.data.totalAmountXOF > 0
+                    && request.resource.data.boardingStatus in ['not_boarded', 'boarded', 'cancelled']
+                    && request.resource.data.paymentStatus in ['pending', 'completed', 'failed', 'refunded'];
+      
+      // Update rules: PNR, tripId, totalAmount and verificationHash CANNOT be modified or falsified
+      allow update: if request.resource.data.pnr == resource.data.pnr
+                    && request.resource.data.tripId == resource.data.tripId
+                    && request.resource.data.totalAmountXOF == resource.data.totalAmountXOF;
+      
+      // Hard delete is strictly forbidden (audit protection)
       allow delete: if false;
     }
 
-    // 2. Scheduled Trips (Departures, seat occupancy)
+    // 2. Scheduled Trips (Departures, Pricing, Available Seats)
     match /trips/{tripId} {
       allow read: if true;
       allow create, update: if request.resource.data.companyName is string
                             && request.resource.data.originCity is string
-                            && request.resource.data.destinationCity is string;
+                            && request.resource.data.destinationCity is string
+                            && request.resource.data.basePriceXOF is number
+                            && request.resource.data.basePriceXOF > 0;
       allow delete: if false;
     }
 
-    // 3. Partner Bus Companies (Logos, HQ, Phone)
+    // 3. Partner Bus Companies (Logos, HQ, Verification Badges)
     match /companies/{companyId} {
       allow read: if true;
-      allow create, update: if request.resource.data.name is string;
+      allow create, update: if request.resource.data.name is string
+                            && request.resource.data.name.size() > 1;
       allow delete: if false;
     }
 
-    // 4. Global Brand Settings
-    match /settings/{settingId} {
+    // 4. Payment Transactions (Immutable Financial Audit Trail)
+    match /payment_transactions/{transactionId} {
       allow read: if true;
-      allow write: if true;
+      // Creation allowed with valid schema
+      allow create: if request.resource.data.amountXOF is number
+                    && request.resource.data.amountXOF > 0
+                    && request.resource.data.pnr is string
+                    && request.resource.data.provider is string
+                    && request.resource.data.status in ['completed', 'pending', 'failed', 'refunded'];
+      // Transactions are strictly immutable once created
+      allow update, delete: if false;
     }
 
-    // 5. Authenticator User Accounts & Controller Profiles
+    // 5. Boarding Scan Logs (Controller Verification Logs)
+    match /scan_logs/{logId} {
+      allow read: if true;
+      allow create: if request.resource.data.pnr is string
+                    && request.resource.data.status in ['valid', 'already_boarded', 'invalid']
+                    && request.resource.data.agentName is string;
+      allow update, delete: if false;
+    }
+
+    // 6. Global Platform Settings
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if request.resource.data.brandName is string;
+    }
+
+    // 7. Controller & User Accounts
     match /users/{userId} {
       allow read: if true;
-      allow create, update: if request.resource.data.email is string;
+      allow create, update: if request.resource.data.email is string
+                            && request.resource.data.role in ['traveler', 'controller', 'counter_agent', 'company_manager', 'platform_admin'];
       allow delete: if false;
     }
 

@@ -43,8 +43,21 @@ import {
   Flashlight,
   Lightbulb,
   SlidersHorizontal,
-  X
+  X,
+  Image as ImageIcon,
+  SwitchCamera,
+  IdCard,
+  Upload,
+  Scan,
+  BadgeCheck,
+  Smartphone,
+  Download,
+  ShieldAlert
 } from 'lucide-react';
+import jsQR from 'jsqr';
+import { extractPnrFromQrData } from '../utils/pnrExtractor';
+import { verifyTicketIntegrity, checkRateLimit } from '../services/securityService';
+import { InstallAppModal } from './InstallAppModal';
 import {
   saveBookingsToControllerCache,
   getCachedBookingsForController,
@@ -138,17 +151,31 @@ interface MobileControllerTerminalProps {
   currentUser: UserAccount;
   onSignOut: () => void;
   trips: Trip[];
+  onOpenAuthModal?: () => void;
 }
 
 export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> = ({
   currentUser,
   onSignOut,
   trips,
+  onOpenAuthModal,
 }) => {
   const [pnrInput, setPnrInput] = useState<string>('');
-  const [activeBooking, setActiveBooking] = useState<Booking | null>(null);
-  const [scanStatus, setScanStatus] = useState<'idle' | 'valid' | 'already_boarded' | 'not_found'>('idle');
+  const [scanStatus, setScanStatus] = useState<'idle' | 'valid' | 'already_boarded' | 'not_found' | 'fraud_tampered'>('idle');
+  const [securityDetails, setSecurityDetails] = useState<string>('');
   const [isScanningCamera, setIsScanningCamera] = useState<boolean>(false);
+  const [cameraFacingMode, setCameraFacingMode] = useState<'environment' | 'user'>('environment');
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [scanSuccessFlash, setScanSuccessFlash] = useState<boolean>(false);
+  const [isAnalyzingImage, setIsAnalyzingImage] = useState<boolean>(false);
+  const [isProfileModalOpen, setIsProfileModalOpen] = useState<boolean>(false);
+  const [isInstallModalOpen, setIsInstallModalOpen] = useState<boolean>(false);
+  const scanLoopActiveRef = useRef<boolean>(false);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const animFrameIdRef = useRef<number | null>(null);
+  const lastDetectedPnrRef = useRef<string>('');
+  const lastDetectedTimeRef = useRef<number>(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const [selectedTripFilter, setSelectedTripFilter] = useState<string>('all');
   const [scanHistory, setScanHistory] = useState<ScanLogRecord[]>(getStoredScanHistory);
@@ -421,17 +448,46 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     }
   };
 
-  // Inspect ticket by PNR with Offline Cache Fallback
-  const handleInspect = (pnrToInspect: string) => {
-    let cleanPnr = pnrToInspect.trim().toUpperCase();
+  // Handle raw QR code detection with debounce, sound, haptics and inspection
+  const handleRawQrDetected = (rawCode: string) => {
+    if (!rawCode) return;
+    const cleanPnr = extractPnrFromQrData(rawCode);
     if (!cleanPnr) return;
 
-    // Detect if input is raw JSON from AFRIWAY QR Code
-    if (cleanPnr.startsWith('{') && cleanPnr.includes('PNR')) {
+    // Debounce repeated triggers of the same QR code
+    const now = Date.now();
+    if (cleanPnr === lastDetectedPnrRef.current && now - lastDetectedTimeRef.current < 2200) {
+      return;
+    }
+    lastDetectedPnrRef.current = cleanPnr;
+    lastDetectedTimeRef.current = now;
+
+    // Visual scan flash
+    setScanSuccessFlash(true);
+    setTimeout(() => setScanSuccessFlash(false), 800);
+
+    // Haptic feedback
+    if (typeof navigator !== 'undefined' && navigator.vibrate) {
       try {
-        const parsed = JSON.parse(pnrToInspect);
-        if (parsed.pnr) cleanPnr = parsed.pnr.trim().toUpperCase();
+        navigator.vibrate([70, 40, 70]);
       } catch {}
+    }
+
+    setPnrInput(cleanPnr);
+    handleInspect(cleanPnr);
+  };
+
+  // Inspect ticket by PNR with Cryptographic Integrity Check and Offline Cache Fallback
+  const handleInspect = async (pnrToInspect: string) => {
+    const cleanPnr = extractPnrFromQrData(pnrToInspect);
+    if (!cleanPnr) return;
+
+    // Anti-Brute-Force rate limiter
+    const rateCheck = checkRateLimit('scanner_terminal');
+    if (!rateCheck.allowed) {
+      setSyncNotice(`⚠️ Anti-Brute-Force actif : attente requise ${rateCheck.retryAfterSeconds}s.`);
+      playAudioBeep('error');
+      return;
     }
 
     setLastScannedPnr(cleanPnr);
@@ -454,6 +510,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     if (!booking) {
       setActiveBooking(null);
       setScanStatus('not_found');
+      setSecurityDetails('Aucune correspondance en base de données.');
       playAudioBeep('error');
       recordScanToHistory({
         pnr: cleanPnr,
@@ -469,6 +526,27 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     }
 
     setActiveBooking(booking);
+
+    // 4. Cryptographic Digital Signature & Anti-Fraud Verification
+    const integrity = await verifyTicketIntegrity(booking);
+    setSecurityDetails(integrity.details);
+
+    if (!integrity.isValid) {
+      setScanStatus('fraud_tampered');
+      playAudioBeep('error');
+      recordScanToHistory({
+        pnr: booking.pnr,
+        passengerName: `${booking.passengers[0]?.firstName} ${booking.passengers[0]?.lastName} [FRAUDE SIGNATURE]`,
+        tripSummary: `${booking.trip.originCity} ➔ ${booking.trip.destinationCity}`,
+        seatNumber: booking.passengers.map(p => p.seatNumber).join(', '),
+        status: 'invalid',
+        agentName: currentUser.displayName,
+        companyName: booking.trip.companyName,
+        syncMode: isOnline ? 'cloud' : 'offline_cache',
+      });
+      return;
+    }
+
     if (booking.boardingStatus === 'boarded') {
       setScanStatus('already_boarded');
       playAudioBeep('warning');
@@ -559,39 +637,190 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     }
   };
 
-  // Camera toggle with real video stream
-  const toggleCamera = async () => {
-    if (isScanningCamera) {
+  // Run jsQR decoding on video frame
+  const runJsQrOnVideo = (video: HTMLVideoElement) => {
+    try {
+      if (!canvasRef.current) {
+        canvasRef.current = document.createElement('canvas');
+      }
+      const canvas = canvasRef.current;
+      const scale = Math.min(1, 540 / Math.max(video.videoWidth, video.videoHeight));
+      const targetW = Math.max(100, Math.floor(video.videoWidth * scale));
+      const targetH = Math.max(100, Math.floor(video.videoHeight * scale));
+
+      if (canvas.width !== targetW || canvas.height !== targetH) {
+        canvas.width = targetW;
+        canvas.height = targetH;
+      }
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (ctx) {
+        ctx.drawImage(video, 0, 0, targetW, targetH);
+        const imageData = ctx.getImageData(0, 0, targetW, targetH);
+        const code = jsQR(imageData.data, imageData.width, imageData.height, {
+          inversionAttempts: 'dontInvert',
+        });
+        if (code && code.data) {
+          handleRawQrDetected(code.data);
+        }
+      }
+    } catch {
+      // frame decode error caught
+    }
+  };
+
+  // Continuous frame analysis loop for live QR code recognition
+  const scanQrFrame = () => {
+    if (!scanLoopActiveRef.current) return;
+    const video = videoRef.current;
+
+    if (
+      video &&
+      video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+      video.videoWidth > 0 &&
+      video.videoHeight > 0
+    ) {
+      if ('BarcodeDetector' in window) {
+        try {
+          const detector = new (window as any).BarcodeDetector({
+            formats: ['qr_code', 'code_128', 'ean_13', 'data_matrix'],
+          });
+          detector
+            .detect(video)
+            .then((barcodes: any[]) => {
+              if (barcodes && barcodes.length > 0 && barcodes[0].rawValue) {
+                handleRawQrDetected(barcodes[0].rawValue);
+              } else {
+                runJsQrOnVideo(video);
+              }
+            })
+            .catch(() => {
+              runJsQrOnVideo(video);
+            });
+        } catch {
+          runJsQrOnVideo(video);
+        }
+      } else {
+        runJsQrOnVideo(video);
+      }
+    }
+
+    if (scanLoopActiveRef.current) {
+      animFrameIdRef.current = requestAnimationFrame(scanQrFrame);
+    }
+  };
+
+  // Camera start with active scanning
+  const startCamera = async (facing: 'environment' | 'user' = cameraFacingMode) => {
+    setCameraError(null);
+    try {
       if (videoRef.current && videoRef.current.srcObject) {
         const stream = videoRef.current.srcObject as MediaStream;
         stream.getTracks().forEach((track) => track.stop());
       }
-      setIsScanningCamera(false);
-    } else {
-      setIsScanningCamera(true);
-      try {
-        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: 'environment' }
-          });
-          if (videoRef.current) {
-            videoRef.current.srcObject = stream;
-            videoRef.current.play();
-          }
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        const constraints: MediaStreamConstraints = {
+          video: {
+            facingMode: { ideal: facing },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+        };
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.setAttribute('playsinline', 'true');
+          await videoRef.current.play();
         }
-      } catch (err) {
-        console.warn('Camera preview not available or permission denied:', err);
+        setIsScanningCamera(true);
+        scanLoopActiveRef.current = true;
+        animFrameIdRef.current = requestAnimationFrame(scanQrFrame);
+      } else {
+        setCameraError("La caméra n'est pas supportée par ce navigateur.");
       }
+    } catch (err: any) {
+      console.warn('Camera preview not available or permission denied:', err);
+      setCameraError("Impossible d'activer la caméra. Vérifiez les autorisations de votre téléphone ou utilisez 'Importer Photo QR'.");
+      setIsScanningCamera(false);
+      scanLoopActiveRef.current = false;
     }
+  };
+
+  // Camera stop
+  const stopCamera = () => {
+    scanLoopActiveRef.current = false;
+    if (animFrameIdRef.current) {
+      cancelAnimationFrame(animFrameIdRef.current);
+      animFrameIdRef.current = null;
+    }
+    if (videoRef.current && videoRef.current.srcObject) {
+      const stream = videoRef.current.srcObject as MediaStream;
+      stream.getTracks().forEach((track) => track.stop());
+      videoRef.current.srcObject = null;
+    }
+    setIsScanningCamera(false);
+    setIsTorchOn(false);
+  };
+
+  // Toggle Camera on/off
+  const toggleCamera = () => {
+    if (isScanningCamera) {
+      stopCamera();
+    } else {
+      startCamera();
+    }
+  };
+
+  // Switch between front and rear cameras
+  const switchCameraFacing = () => {
+    const nextFacing = cameraFacingMode === 'environment' ? 'user' : 'environment';
+    setCameraFacingMode(nextFacing);
+    if (isScanningCamera) {
+      startCamera(nextFacing);
+    }
+  };
+
+  // File upload scan (photo from gallery or camera capture)
+  const handleImageFileScan = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setIsAnalyzingImage(true);
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(img, 0, 0);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const code = jsQR(imageData.data, imageData.width, imageData.height, {
+              inversionAttempts: 'attemptBoth',
+            });
+            if (code && code.data) {
+              handleRawQrDetected(code.data);
+            } else {
+              alert("Aucun QR code lisible n'a été trouvé sur cette photo. Assurez-vous que le QR code soit net et non flou.");
+            }
+          }
+        } catch (err) {
+          console.error('Error scanning image:', err);
+        } finally {
+          setIsAnalyzingImage(false);
+        }
+      };
+      img.src = event.target?.result as string;
+    };
+    reader.readAsDataURL(file);
+    e.target.value = '';
   };
 
   // Clean camera tracks on unmount
   useEffect(() => {
     return () => {
-      if (videoRef.current && videoRef.current.srcObject) {
-        const stream = videoRef.current.srcObject as MediaStream;
-        stream.getTracks().forEach((track) => track.stop());
-      }
+      stopCamera();
     };
   }, []);
 
@@ -665,13 +894,13 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
   };
 
   return (
-    <div className={`min-h-screen flex flex-col antialiased transition-colors duration-200 ${
+    <div className={`min-h-screen min-h-screen-safe pb-safe flex flex-col antialiased transition-colors duration-200 ${
       effectiveTheme === 'dark'
         ? 'bg-slate-950 text-slate-100'
         : 'bg-slate-100 text-slate-900'
     }`}>
       {/* 1. TOP MOBILE CONTROLLER RESTRICTED BAR */}
-      <header className={`sticky top-0 z-40 px-3.5 py-2.5 shadow-md flex items-center justify-between border-b transition-colors ${
+      <header className={`sticky top-0 z-40 pt-safe px-2.5 sm:px-4 py-2 sm:py-2.5 shadow-md flex items-center justify-between border-b transition-colors ${
         effectiveTheme === 'dark'
           ? 'bg-slate-950 border-emerald-900/60'
           : 'bg-white border-slate-200 shadow-xs'
@@ -845,6 +1074,33 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
             {soundEnabled ? <Volume2 className="w-4 h-4 text-emerald-500" /> : <VolumeX className="w-4 h-4 text-slate-500" />}
           </button>
 
+          {/* Mobile PWA Install Guide Button */}
+          <button
+            onClick={() => setIsInstallModalOpen(true)}
+            className={`p-2 rounded-lg transition-colors cursor-pointer border ${
+              effectiveTheme === 'dark'
+                ? 'bg-slate-800 border-slate-700 text-emerald-400 hover:text-emerald-300'
+                : 'bg-slate-100 border-slate-300 text-emerald-700 hover:text-emerald-800'
+            }`}
+            title="Installer l'application sur smartphone Android / iPhone (PWA)"
+          >
+            <Download className="w-4 h-4" />
+          </button>
+
+          {/* Controller Authenticator & Profile Badge Button */}
+          <button
+            onClick={() => setIsProfileModalOpen(true)}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-bold transition-all cursor-pointer ${
+              effectiveTheme === 'dark'
+                ? 'bg-amber-950/70 text-amber-300 border-amber-800 hover:bg-amber-900'
+                : 'bg-amber-50 text-amber-950 border-amber-300 hover:bg-amber-100'
+            }`}
+            title="Badge & Profil Authenticator du Contrôleur"
+          >
+            <IdCard className="w-3.5 h-3.5 text-amber-500" />
+            <span className="hidden sm:inline font-mono font-bold">{currentUser.badgeId || 'Badge'}</span>
+          </button>
+
           {/* Sign Out */}
           <button
             onClick={onSignOut}
@@ -986,25 +1242,78 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
           {/* MAIN SCANNING INTERFACE */}
           <main className="flex-1 max-w-lg w-full mx-auto p-4 space-y-4">
             
-            {/* Phone Camera Scanner Card */}
+            {/* Phone Camera Scanner Card with Real-Time QR Engine */}
             <div className={`rounded-2xl border p-4 shadow-xl overflow-hidden transition-colors ${
               effectiveTheme === 'dark'
                 ? 'bg-slate-800/90 border-slate-700 text-slate-100 shadow-black/40'
                 : 'bg-white border-slate-200 text-slate-900 shadow-md'
             }`}>
-              <div className="flex items-center justify-between mb-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
                 <div className="flex items-center gap-2">
-                  <Camera className="w-4 h-4 text-emerald-500" />
-                  <h3 className={`text-xs font-bold uppercase tracking-wider ${
-                    effectiveTheme === 'dark' ? 'text-slate-200' : 'text-slate-800'
-                  }`}>
-                    Scanner Caméra Mobile
-                  </h3>
+                  <div className="w-6 h-6 rounded-lg bg-emerald-600/20 text-emerald-500 flex items-center justify-center">
+                    <Scan className="w-4 h-4 text-emerald-500" />
+                  </div>
+                  <div>
+                    <h3 className={`text-xs font-black uppercase tracking-wider flex items-center gap-1.5 ${
+                      effectiveTheme === 'dark' ? 'text-slate-100' : 'text-slate-900'
+                    }`}>
+                      <span>Scanner Téléphone Contrôleur</span>
+                      {isScanningCamera && (
+                        <span className="inline-flex items-center px-1.5 py-0.2 rounded-full text-[9px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 animate-pulse">
+                          Live Active
+                        </span>
+                      )}
+                    </h3>
+                  </div>
                 </div>
-                <div className="flex items-center gap-1.5">
+
+                {/* Toolbar Buttons: Torch, Flip, File Upload, Camera Toggle */}
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {/* Photo / Screenshot Upload Scan */}
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    onChange={handleImageFileScan}
+                    className="hidden"
+                  />
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isAnalyzingImage}
+                    className={`px-2 py-1 text-xs font-bold rounded-lg flex items-center gap-1 transition-all cursor-pointer border ${
+                      effectiveTheme === 'dark'
+                        ? 'bg-slate-700 border-slate-600 text-slate-200 hover:text-white hover:bg-slate-600'
+                        : 'bg-slate-100 border-slate-300 text-slate-700 hover:text-slate-900 hover:bg-slate-200'
+                    }`}
+                    title="Importer une photo ou capture d'écran de QR Code"
+                  >
+                    {isAnalyzingImage ? (
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-500" />
+                    ) : (
+                      <ImageIcon className="w-3.5 h-3.5 text-emerald-500" />
+                    )}
+                    <span className="hidden sm:inline">Photo QR</span>
+                  </button>
+
+                  {/* Switch Front/Rear Camera if scanning */}
+                  {isScanningCamera && (
+                    <button
+                      onClick={switchCameraFacing}
+                      className={`p-1.5 text-xs font-bold rounded-lg border transition-all cursor-pointer ${
+                        effectiveTheme === 'dark'
+                          ? 'bg-slate-700 border-slate-600 text-slate-200 hover:text-white'
+                          : 'bg-slate-100 border-slate-300 text-slate-700 hover:text-slate-900'
+                      }`}
+                      title={`Changer de caméra (Actuel : ${cameraFacingMode === 'environment' ? 'Arrière' : 'Avant'})`}
+                    >
+                      <SwitchCamera className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+
+                  {/* Hardware Torch / Screen Light Toggle */}
                   <button
                     onClick={toggleTorch}
-                    className={`px-2.5 py-1 text-xs font-bold rounded-lg flex items-center gap-1 transition-all cursor-pointer border ${
+                    className={`px-2 py-1 text-xs font-bold rounded-lg flex items-center gap-1 transition-all cursor-pointer border ${
                       isTorchOn
                         ? 'bg-amber-400 text-slate-950 border-amber-300 font-black shadow-[0_0_10px_rgba(251,191,36,0.6)] animate-pulse'
                         : effectiveTheme === 'dark'
@@ -1017,12 +1326,13 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                     <span className="hidden xs:inline">{isTorchOn ? 'Torche ON' : 'Torche'}</span>
                   </button>
 
+                  {/* Camera ON / OFF Button */}
                   <button
                     onClick={toggleCamera}
-                    className={`px-3 py-1 text-xs font-bold rounded-lg flex items-center gap-1.5 transition-all cursor-pointer ${
+                    className={`px-3 py-1.5 text-xs font-black rounded-lg flex items-center gap-1.5 transition-all cursor-pointer shadow-md ${
                       isScanningCamera 
-                        ? 'bg-rose-700 hover:bg-rose-800 text-white shadow-xs' 
-                        : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-xs'
+                        ? 'bg-rose-600 hover:bg-rose-700 text-white' 
+                        : 'bg-emerald-600 hover:bg-emerald-500 text-white'
                     }`}
                   >
                     {isScanningCamera ? (
@@ -1040,53 +1350,124 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                 </div>
               </div>
 
-              {/* Camera Viewfinder */}
+              {/* Camera Error Message */}
+              {cameraError && (
+                <div className="mb-3 p-2.5 rounded-xl bg-rose-950/40 border border-rose-800 text-rose-300 text-xs flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400" />
+                    <span className="truncate">{cameraError}</span>
+                  </div>
+                  <button
+                    onClick={() => startCamera()}
+                    className="px-2 py-0.5 bg-rose-800 hover:bg-rose-700 text-white font-bold rounded text-[10px] shrink-0 cursor-pointer"
+                  >
+                    Réessayer
+                  </button>
+                </div>
+              )}
+
+              {/* Camera Viewfinder with Real Video Stream & Scanning Laser */}
               {isScanningCamera ? (
-                <div className="relative aspect-4/3 bg-black rounded-xl overflow-hidden border-2 border-emerald-500 shadow-inner">
+                <div className={`relative aspect-4/3 bg-black rounded-xl overflow-hidden border-2 shadow-inner transition-colors duration-200 ${
+                  scanSuccessFlash ? 'border-emerald-400 ring-4 ring-emerald-400/60' : 'border-emerald-600'
+                }`}>
                   <video 
                     ref={videoRef} 
                     className="w-full h-full object-cover" 
                     playsInline 
                     muted 
+                    autoPlay
                   />
-                  {/* Animated Laser Scanning Line */}
+
+                  {/* Hidden offscreen canvas for frame extraction */}
+                  <canvas ref={canvasRef} className="hidden" />
+
+                  {/* Animated Laser Sweep Line */}
                   <div className="absolute inset-x-0 h-0.5 bg-emerald-400 shadow-[0_0_12px_#34d399] animate-[bounce_2s_infinite]" />
                   
-                  {/* Torch active indicator overlay */}
+                  {/* Torch active overlay pill */}
                   {isTorchOn && (
-                    <div className="absolute top-2 right-2 px-2 py-0.5 rounded-full bg-amber-400/90 text-slate-950 font-black text-[9px] flex items-center gap-1 shadow-md">
-                      <Flashlight className="w-2.5 h-2.5" />
+                    <div className="absolute top-2 right-2 px-2 py-0.5 rounded-full bg-amber-400/90 text-slate-950 font-black text-[9px] flex items-center gap-1 shadow-md z-10">
+                      <Flashlight className="w-2.5 h-2.5 fill-slate-950" />
                       <span>TORCHE ACTIVE</span>
                     </div>
                   )}
 
-                  {/* Corner targeting brackets */}
-                  <div className="absolute inset-6 pointer-events-none border-2 border-dashed border-emerald-400/70 rounded-lg flex items-center justify-center">
-                    <span className="text-[10px] bg-black/60 px-2 py-0.5 rounded text-emerald-300 font-mono">
-                      Pointez vers le QR Code du billet
-                    </span>
+                  {/* Detection Success Flash Overlay */}
+                  {scanSuccessFlash && (
+                    <div className="absolute inset-0 bg-emerald-500/20 flex items-center justify-center z-20 animate-in fade-in duration-75">
+                      <div className="px-3 py-1.5 rounded-xl bg-emerald-600 text-white font-black text-xs flex items-center gap-1.5 shadow-2xl">
+                        <CheckCircle2 className="w-4 h-4" />
+                        <span>QR CODE DÉTECTÉ !</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* High-visibility Targeting Reticle */}
+                  <div className="absolute inset-6 pointer-events-none flex flex-col items-center justify-between z-10">
+                    <div className="w-full flex justify-between">
+                      <div className="w-6 h-6 border-t-3 border-l-3 border-emerald-400 rounded-tl-sm shadow-xs" />
+                      <div className="w-6 h-6 border-t-3 border-r-3 border-emerald-400 rounded-tr-sm shadow-xs" />
+                    </div>
+
+                    <div className="text-center px-2 py-1 rounded bg-black/70 backdrop-blur-xs text-emerald-300 font-mono text-[10px] tracking-wide border border-emerald-500/30">
+                      Pointez vers le QR Code AFRIWAY (Scan Live Automatique)
+                    </div>
+
+                    <div className="w-full flex justify-between">
+                      <div className="w-6 h-6 border-b-3 border-l-3 border-emerald-400 rounded-bl-sm shadow-xs" />
+                      <div className="w-6 h-6 border-b-3 border-r-3 border-emerald-400 rounded-br-sm shadow-xs" />
+                    </div>
                   </div>
                 </div>
               ) : (
-                <div className={`aspect-16/9 rounded-xl border border-dashed flex flex-col items-center justify-center p-4 text-center transition-colors ${
+                /* Inactive Viewfinder Prompt */
+                <div className={`aspect-16/9 rounded-xl border border-dashed flex flex-col items-center justify-center p-4 text-center transition-colors relative overflow-hidden ${
                   effectiveTheme === 'dark'
                     ? 'bg-slate-900/80 border-slate-700 text-slate-400'
                     : 'bg-slate-50 border-slate-300 text-slate-500'
                 }`}>
-                  <QrCode className={`w-10 h-10 mb-2 ${effectiveTheme === 'dark' ? 'text-slate-600' : 'text-slate-400'}`} />
-                  <p className="text-xs max-w-[240px]">
-                    Activez la caméra arrière pour scanner instantanément les e-billets présentés sur smartphone ou papier.
+                  <div className="w-12 h-12 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-500 flex items-center justify-center mb-2">
+                    <QrCode className="w-6 h-6" />
+                  </div>
+                  <p className="text-xs font-semibold max-w-[260px] text-slate-300">
+                    Caméra éteinte. Cliquez sur <strong className="text-emerald-400">"Activer Caméra"</strong> pour scanner en continu ou importez une photo.
                   </p>
+                  <div className="mt-2.5 flex items-center gap-2">
+                    <button
+                      onClick={toggleCamera}
+                      className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg text-xs flex items-center gap-1.5 cursor-pointer shadow-sm"
+                    >
+                      <Camera className="w-3.5 h-3.5" />
+                      <span>Démarrer Scan Live</span>
+                    </button>
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      className={`px-3 py-1 font-bold rounded-lg text-xs flex items-center gap-1.5 cursor-pointer border ${
+                        effectiveTheme === 'dark'
+                          ? 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white'
+                          : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-100'
+                      }`}
+                    >
+                      <Upload className="w-3.5 h-3.5 text-amber-500" />
+                      <span>Photo QR</span>
+                    </button>
+                  </div>
                 </div>
               )}
 
-              {/* Quick Demo Scan Buttons for Testing on Phone */}
+              {/* Quick Demo Scan Buttons for Instant Testing on Phone */}
               <div className={`mt-3 pt-3 border-t ${effectiveTheme === 'dark' ? 'border-slate-700/60' : 'border-slate-200'}`}>
-                <span className={`text-[10px] uppercase font-bold block mb-1.5 ${
-                  effectiveTheme === 'dark' ? 'text-slate-400' : 'text-slate-500'
-                }`}>
-                  Billets de test rapides (Cliquez pour tester) :
-                </span>
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className={`text-[10px] uppercase font-bold tracking-wider ${
+                    effectiveTheme === 'dark' ? 'text-slate-400' : 'text-slate-500'
+                  }`}>
+                    Billets de test rapides (Simulation 1-Clic) :
+                  </span>
+                  <span className="text-[10px] text-emerald-400 font-semibold font-mono">
+                    {recentBookings.length} en base
+                  </span>
+                </div>
                 <div className="flex flex-wrap gap-1.5">
                   {recentBookings.slice(0, 3).map((b) => (
                     <button
@@ -1095,15 +1476,36 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                         setPnrInput(b.pnr);
                         handleInspect(b.pnr);
                       }}
-                      className={`px-2.5 py-1 text-[11px] font-mono font-bold rounded border transition-colors cursor-pointer ${
+                      className={`px-2.5 py-1 text-[11px] font-mono font-bold rounded border transition-colors cursor-pointer flex items-center gap-1 ${
                         effectiveTheme === 'dark'
                           ? 'bg-slate-700 hover:bg-slate-600 text-slate-200 border-slate-600'
                           : 'bg-slate-100 hover:bg-slate-200 text-slate-800 border-slate-300'
                       }`}
+                      title={`Passager : ${b.passengers[0]?.firstName} ${b.passengers[0]?.lastName} - Statut : ${b.boardingStatus}`}
                     >
-                      {b.pnr} ({b.passengers[0]?.firstName})
+                      <span className={b.boardingStatus === 'boarded' ? 'text-amber-400' : 'text-emerald-400'}>
+                        ●
+                      </span>
+                      <span>{b.pnr}</span>
+                      <span className="text-[10px] text-slate-400">({b.passengers[0]?.firstName})</span>
                     </button>
                   ))}
+
+                  {/* Invalid ticket test button */}
+                  <button
+                    onClick={() => {
+                      setPnrInput('AFW-INVALIDE-99');
+                      handleInspect('AFW-INVALIDE-99');
+                    }}
+                    className={`px-2 py-1 text-[10px] font-mono font-bold rounded border transition-colors cursor-pointer text-rose-400 ${
+                      effectiveTheme === 'dark'
+                        ? 'bg-rose-950/40 border-rose-800 hover:bg-rose-900/60'
+                        : 'bg-rose-50 border-rose-300 hover:bg-rose-100 text-rose-700'
+                    }`}
+                    title="Simuler un faux billet ou PNR introuvable"
+                  >
+                    Test Billet Faux ❌
+                  </button>
                 </div>
               </div>
             </div>
@@ -1861,10 +2263,155 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
         </div>
       )}
 
-      {/* 4. Screen Illuminator Overlay when Torch is ON (for scanning in pitch dark outdoor terminals) */}
+      {/* 4. CONTROLLER PROFILE & AUTHENTICATOR MODAL */}
+      {isProfileModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150">
+          <div className={`rounded-3xl border w-full max-w-md shadow-2xl p-5 sm:p-6 transition-colors ${
+            effectiveTheme === 'dark'
+              ? 'bg-slate-900 border-slate-700 text-slate-100'
+              : 'bg-white border-slate-200 text-slate-900'
+          }`}>
+            <div className="flex items-center justify-between pb-3 border-b border-slate-700/60 mb-4">
+              <div className="flex items-center gap-2">
+                <div className="w-9 h-9 rounded-xl bg-amber-500 text-white flex items-center justify-center shadow-md">
+                  <IdCard className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-black tracking-tight">
+                    Badge Contrôleur & Authenticator
+                  </h3>
+                  <p className="text-xs text-amber-500 font-medium">
+                    Session de vérification mobile active
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsProfileModalOpen(false)}
+                className="p-1 rounded-full text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Official Badge Card */}
+            <div className={`p-4 rounded-2xl border-2 mb-4 ${
+              effectiveTheme === 'dark'
+                ? 'bg-slate-950/80 border-amber-500/50'
+                : 'bg-amber-50/70 border-amber-400'
+            }`}>
+              <div className="flex items-center gap-3 mb-3">
+                <div className="w-12 h-12 rounded-2xl bg-amber-500 text-white flex items-center justify-center font-black text-xl shadow-md">
+                  {currentUser.displayName.charAt(0).toUpperCase()}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    <h4 className="font-extrabold text-sm truncate">{currentUser.displayName}</h4>
+                    <span className="px-1.5 py-0.2 rounded text-[10px] font-mono font-black bg-amber-500 text-slate-950">
+                      {currentUser.badgeId || 'CTRL-BKO-01'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-400 mt-0.5">{currentUser.email}</p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 text-xs pt-2 border-t border-slate-800">
+                <div>
+                  <span className="text-[10px] text-slate-400 block">Compagnie :</span>
+                  <span className="font-bold text-emerald-400">{currentUser.assignedCompanyName || 'Nour Transport'}</span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-400 block">Quai / Gare :</span>
+                  <span className="font-bold truncate block">{currentUser.assignedStation?.split(',')[0] || 'Gare Sogoniko'}</span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-400 block">Statut Service :</span>
+                  <span className="font-bold text-emerald-400 flex items-center gap-1">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                    En service actif
+                  </span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-400 block">Scans ce quart :</span>
+                  <span className="font-mono font-bold">{scanHistory.length} passagers</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Security Notice for Controller Phone */}
+            <div className={`p-3 rounded-xl border text-[11px] mb-4 space-y-1 ${
+              effectiveTheme === 'dark'
+                ? 'bg-amber-950/30 border-amber-800/60 text-amber-200'
+                : 'bg-amber-50 border-amber-300 text-amber-900'
+            }`}>
+              <div className="font-bold flex items-center gap-1 text-xs text-amber-500">
+                <ShieldCheck className="w-4 h-4" />
+                <span>Règle de Sécurité Embarquement :</span>
+              </div>
+              <p>
+                Ce compte est <strong>strictement restreint au scan smartphone</strong>. Vous ne pouvez que valider les billets à l'accès au bus. La réservation et la vente de billets sont inaccessibles depuis ce compte contrôleur.
+              </p>
+            </div>
+
+            {/* Actions */}
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={() => {
+                  setIsProfileModalOpen(false);
+                  setIsInstallModalOpen(true);
+                }}
+                className="w-full py-2.5 px-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer shadow-sm transition-colors"
+              >
+                <Download className="w-4 h-4" />
+                <span>Installer sur ce Téléphone (PWA Plein Écran)</span>
+              </button>
+
+              <div className="flex flex-col sm:flex-row gap-2">
+                <button
+                  onClick={() => {
+                    setIsProfileModalOpen(false);
+                    if (onOpenAuthModal) onOpenAuthModal();
+                    else onSignOut();
+                  }}
+                  className="flex-1 py-2 px-3 bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shadow-sm transition-colors"
+                >
+                  <Smartphone className="w-3.5 h-3.5" />
+                  <span>Changer de Contrôleur</span>
+                </button>
+
+                <button
+                  onClick={onSignOut}
+                  className="py-2 px-3 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shadow-sm transition-colors"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span>Déconnexion</span>
+                </button>
+
+                <button
+                  onClick={() => setIsProfileModalOpen(false)}
+                  className={`py-2 px-3 text-xs font-bold rounded-xl border transition-colors cursor-pointer ${
+                    effectiveTheme === 'dark'
+                      ? 'bg-slate-800 text-slate-300 hover:text-white border-slate-700'
+                      : 'bg-slate-100 text-slate-700 hover:text-slate-900 border-slate-300'
+                  }`}
+                >
+                  Fermer
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 5. Screen Illuminator Overlay when Torch is ON (for scanning in pitch dark outdoor terminals) */}
       {isTorchOn && (
         <div className="pointer-events-none fixed inset-0 z-30 ring-8 ring-amber-400/80 shadow-[inset_0_0_100px_rgba(255,255,255,0.4)] animate-pulse" />
       )}
+
+      {/* 6. Mobile PWA Installation Guide Modal */}
+      <InstallAppModal
+        isOpen={isInstallModalOpen}
+        onClose={() => setIsInstallModalOpen(false)}
+      />
     </div>
   );
 };

@@ -256,7 +256,7 @@ export async function generateTicketPDF(booking: Booking, currency: Currency = '
   doc.text('• Présentez ce document ou ce QR code sur votre écran au contrôleur de quai.', 68, qrSectionY + 22);
   doc.text(`• Présentation impérative à ${convocationTime} (30 min avant le départ).`, 68, qrSectionY + 28);
   doc.text('• Franchise autorisée : 25 kg en soute + 7 kg en cabine par voyageur.', 68, qrSectionY + 34);
-  doc.text(`• Montant réglé : ${formatPrice(booking.totalAmountXOF, currency)} via ${booking.paymentProvider.toUpperCase()}.`, 68, qrSectionY + 40);
+  doc.text(`• Montant réglé : ${formatPrice(booking.totalAmountXOF, currency)} via ${booking.paymentProvider.toUpperCase()}${booking.transactionId ? ` (Réf: ${booking.transactionId})` : ''}.`, 68, qrSectionY + 40);
   doc.text('• Billet nominatif et infalsifiable. Contrôle automatique par scanner.', 68, qrSectionY + 46);
 
   // Security Checksum Hash Bar

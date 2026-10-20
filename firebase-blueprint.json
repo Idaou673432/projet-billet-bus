@@ -21,9 +21,49 @@
         "verificationHash": { "type": "string" },
         "notes": { "type": "string" },
         "trip": { "type": "object" },
-        "companyLogoUrl": { "type": "string" }
+        "companyLogoUrl": { "type": "string" },
+        "transactionId": { "type": "string" },
+        "paymentReceiptNumber": { "type": "string" }
       },
       "required": ["pnr", "tripId", "passengers", "totalAmountXOF", "boardingStatus"]
+    },
+    "paymentTransaction": {
+      "title": "PaymentTransaction",
+      "description": "Immutable payment record across Mobile Money and Cards",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "bookingId": { "type": "string" },
+        "pnr": { "type": "string" },
+        "provider": { "type": "string" },
+        "providerReference": { "type": "string" },
+        "amountXOF": { "type": "number" },
+        "feeXOF": { "type": "number" },
+        "totalDebitedXOF": { "type": "number" },
+        "currency": { "type": "string" },
+        "payerPhone": { "type": "string" },
+        "payerName": { "type": "string" },
+        "status": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "receiptNumber": { "type": "string" }
+      },
+      "required": ["id", "pnr", "provider", "amountXOF", "status"]
+    },
+    "scanLog": {
+      "title": "ScanLogRecord",
+      "description": "Boarding verification audit record created by controllers",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "pnr": { "type": "string" },
+        "scannedAt": { "type": "string" },
+        "passengerName": { "type": "string" },
+        "tripSummary": { "type": "string" },
+        "seatNumber": { "type": "string" },
+        "status": { "type": "string" },
+        "agentName": { "type": "string" }
+      },
+      "required": ["id", "pnr", "status", "agentName"]
     },
     "trip": {
       "title": "Trip",
@@ -116,6 +156,14 @@
     "/bookings/{bookingId}": {
       "schema": { "$ref": "#/entities/booking" },
       "description": "Live passenger bookings and boarding records"
+    },
+    "/payment_transactions/{transactionId}": {
+      "schema": { "$ref": "#/entities/paymentTransaction" },
+      "description": "Immutable payment audit records"
+    },
+    "/scan_logs/{logId}": {
+      "schema": { "$ref": "#/entities/scanLog" },
+      "description": "Audit trail of ticket scans by station controllers"
     },
     "/trips/{tripId}": {
       "schema": { "$ref": "#/entities/trip" },

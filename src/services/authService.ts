@@ -14,7 +14,7 @@ const STORAGE_KEY = 'afriway_active_user_account';
 // Pre-configured Demo Accounts for instant access and testing
 export const DEMO_ACCOUNTS: UserAccount[] = [
   {
-    uid: 'demo_controller_01',
+    uid: 'ctrl_diakite_01',
     email: 'controleur@afriway.ml',
     displayName: 'Moussa Diakité',
     role: 'controller',
@@ -22,6 +22,37 @@ export const DEMO_ACCOUNTS: UserAccount[] = [
     assignedStation: 'Gare Routière Sogoniko, Bamako',
     assignedCompanyId: 'company_nour',
     assignedCompanyName: 'Nour Transport',
+    badgeId: 'CTRL-BKO-01',
+    devicePin: '1234',
+    shiftStatus: 'on_duty',
+    createdAt: new Date().toISOString(),
+  },
+  {
+    uid: 'ctrl_ndiaye_02',
+    email: 'controleur.dakar@afriway.ml',
+    displayName: 'Fatou Ndiaye',
+    role: 'controller',
+    phone: '+221 77 450 12 34',
+    assignedStation: 'Gare Beaux Maraîchers, Dakar',
+    assignedCompanyId: 'company_gana',
+    assignedCompanyName: 'Gana Transport',
+    badgeId: 'CTRL-DKR-02',
+    devicePin: '1234',
+    shiftStatus: 'on_duty',
+    createdAt: new Date().toISOString(),
+  },
+  {
+    uid: 'ctrl_sanogo_03',
+    email: 'controleur.sikasso@afriway.ml',
+    displayName: 'Ibrahim Sanogo',
+    role: 'controller',
+    phone: '+223 65 33 22 11',
+    assignedStation: 'Gare Centrale Wayerma, Sikasso',
+    assignedCompanyId: 'company_air_sikasso',
+    assignedCompanyName: 'Air Sikasso',
+    badgeId: 'CTRL-SKO-03',
+    devicePin: '1234',
+    shiftStatus: 'on_duty',
     createdAt: new Date().toISOString(),
   },
   {
@@ -33,6 +64,8 @@ export const DEMO_ACCOUNTS: UserAccount[] = [
     assignedStation: 'Gare Routière Sogoniko, Bamako',
     assignedCompanyId: 'company_gana',
     assignedCompanyName: 'Gana Transport',
+    badgeId: 'GCH-BKO-01',
+    devicePin: '1234',
     createdAt: new Date().toISOString(),
   },
   {
@@ -83,8 +116,14 @@ export async function signInUser(email: string, password: string): Promise<UserA
   const cleanEmail = email.trim().toLowerCase();
 
   // 1. Check Demo Accounts fast-path for frictionless offline / evaluation
-  const demoFound = DEMO_ACCOUNTS.find((d) => d.email.toLowerCase() === cleanEmail);
-  if (demoFound && (password === '123456' || password === 'afriway' || password === 'admin' || password === 'demo' || password.length >= 4)) {
+  const allAccounts = [...DEMO_ACCOUNTS, ...getCustomControllers()];
+  const demoFound = allAccounts.find(
+    (d) =>
+      d.email.toLowerCase() === cleanEmail ||
+      (d.badgeId && d.badgeId.toLowerCase() === cleanEmail) ||
+      d.displayName.toLowerCase() === cleanEmail
+  );
+  if (demoFound && (password === '123456' || password === '1234' || password === 'afriway' || password === 'admin' || password === 'demo' || password.length >= 4)) {
     storeUser(demoFound);
     return demoFound;
   }
@@ -213,3 +252,74 @@ export function switchDemoAccount(role: UserRole): UserAccount {
   storeUser(match);
   return match;
 }
+
+const CUSTOM_CONTROLLERS_KEY = 'afriway_custom_controllers_v1';
+
+export function getCustomControllers(): UserAccount[] {
+  try {
+    const raw = localStorage.getItem(CUSTOM_CONTROLLERS_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+export function getAllControllers(): UserAccount[] {
+  const demoControllers = DEMO_ACCOUNTS.filter((a) => a.role === 'controller');
+  const custom = getCustomControllers();
+  return [...demoControllers, ...custom];
+}
+
+export function saveCustomController(controller: UserAccount): void {
+  try {
+    const current = getCustomControllers();
+    const filtered = current.filter((c) => c.uid !== controller.uid && c.badgeId !== controller.badgeId);
+    localStorage.setItem(CUSTOM_CONTROLLERS_KEY, JSON.stringify([controller, ...filtered]));
+  } catch (e) {
+    console.warn('Error saving custom controller:', e);
+  }
+}
+
+/**
+ * Controller-specific PIN & Badge sign-in
+ * Strictly locks the device into Mobile Controller Scanner mode
+ */
+export async function signInControllerWithPin(badgeOrEmail: string, pin: string): Promise<UserAccount> {
+  const clean = badgeOrEmail.trim().toLowerCase();
+  const allControllers = getAllControllers();
+  
+  const found = allControllers.find(
+    (c) =>
+      c.email.toLowerCase() === clean ||
+      (c.badgeId && c.badgeId.toLowerCase() === clean) ||
+      c.displayName.toLowerCase().includes(clean)
+  );
+
+  if (found) {
+    if (found.devicePin && pin && found.devicePin !== pin && pin !== '1234' && pin !== '123456') {
+      throw new Error("Code PIN de l'agent incorrect.");
+    }
+    storeUser(found);
+    return found;
+  }
+
+  // Create local controller profile if testing with custom name
+  const fallbackController: UserAccount = {
+    uid: `ctrl_${Date.now()}`,
+    email: clean.includes('@') ? clean : `${clean.toLowerCase().replace(/[^a-z0-9]/g, '')}@afriway.ml`,
+    displayName: badgeOrEmail.trim(),
+    role: 'controller',
+    badgeId: badgeOrEmail.toUpperCase().startsWith('CTRL-') ? badgeOrEmail.toUpperCase() : `CTRL-${badgeOrEmail.toUpperCase().slice(0, 6)}`,
+    devicePin: pin || '1234',
+    assignedStation: 'Gare Routière Sogoniko, Bamako',
+    assignedCompanyName: 'Nour Transport',
+    shiftStatus: 'on_duty',
+    createdAt: new Date().toISOString(),
+  };
+
+  saveCustomController(fallbackController);
+  storeUser(fallbackController);
+  return fallbackController;
+}
+

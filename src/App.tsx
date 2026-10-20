@@ -47,6 +47,7 @@ import { AuthModal } from './components/AuthModal';
 import { MobileControllerTerminal } from './components/MobileControllerTerminal';
 import { SmsNotificationBanner } from './components/SmsNotificationBanner';
 import { simulateSendBookingConfirmationSms, SmsNotification } from './services/smsService';
+import { InstallAppModal } from './components/InstallAppModal';
 import { Footer } from './components/Footer';
 
 export default function App() {
@@ -61,6 +62,7 @@ export default function App() {
   // Authenticator & User Account
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(getStoredUser);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
+  const [authModalInitialTab, setAuthModalInitialTab] = useState<'signin' | 'register' | 'controller'>('signin');
 
   // Sync role with logged in user
   useEffect(() => {
@@ -98,6 +100,7 @@ export default function App() {
   const [isMyTicketsOpen, setIsMyTicketsOpen] = useState<boolean>(false);
   const [scannerPrefillPnr, setScannerPrefillPnr] = useState<string>('');
   const [activeSmsNotification, setActiveSmsNotification] = useState<SmsNotification | null>(null);
+  const [isInstallModalOpen, setIsInstallModalOpen] = useState<boolean>(false);
 
   // 1. Initialize Firestore & Subscribe to real-time events for multi-machine synchronization
   useEffect(() => {
@@ -241,9 +244,14 @@ export default function App() {
             setCurrentUser(null);
             setRole('traveler');
           }}
+          onOpenAuthModal={() => {
+            setAuthModalInitialTab('controller');
+            setIsAuthModalOpen(true);
+          }}
         />
         <AuthModal
           isOpen={isAuthModalOpen}
+          initialTab={authModalInitialTab}
           onClose={() => setIsAuthModalOpen(false)}
           currentUser={currentUser}
           onUserChange={(u) => {
@@ -274,7 +282,15 @@ export default function App() {
         role={role}
         setRole={setRole}
         currentUser={currentUser}
-        onOpenAuth={() => setIsAuthModalOpen(true)}
+        onOpenAuth={() => {
+          setAuthModalInitialTab('signin');
+          setIsAuthModalOpen(true);
+        }}
+        onOpenControllerAuth={() => {
+          setAuthModalInitialTab('controller');
+          setIsAuthModalOpen(true);
+        }}
+        onOpenInstall={() => setIsInstallModalOpen(true)}
       />
 
       {/* Main Content Areas */}
@@ -397,6 +413,7 @@ export default function App() {
       {/* 5. Authenticator & Account Management Modal */}
       <AuthModal
         isOpen={isAuthModalOpen}
+        initialTab={authModalInitialTab}
         onClose={() => setIsAuthModalOpen(false)}
         currentUser={currentUser}
         onUserChange={(u) => {
@@ -409,6 +426,12 @@ export default function App() {
       <SmsNotificationBanner
         notification={activeSmsNotification}
         onDismiss={() => setActiveSmsNotification(null)}
+      />
+
+      {/* 7. PWA Installation Guide Modal for Smartphones */}
+      <InstallAppModal
+        isOpen={isInstallModalOpen}
+        onClose={() => setIsInstallModalOpen(false)}
       />
 
       {/* Footer */}

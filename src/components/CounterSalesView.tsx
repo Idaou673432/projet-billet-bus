@@ -1,8 +1,10 @@
 import React, { useState } from 'react';
-import { Trip, Currency, Booking, Passenger } from '../types';
+import { Trip, Currency, Booking, Passenger, PaymentProvider } from '../types';
 import { formatPrice } from '../utils/currency';
 import { saveBooking } from '../utils/storage';
 import { saveBookingToCloud } from '../services/firestoreSync';
+import { createAndSaveTransaction, PAYMENT_PROVIDERS_CATALOG } from '../services/paymentService';
+import { generateTicketSecuritySignature, sanitizeInput } from '../services/securityService';
 import { 
   Building2, 
   Printer, 
@@ -12,7 +14,9 @@ import {
   User, 
   MapPin, 
   Calendar, 
-  Ticket 
+  Ticket,
+  CreditCard,
+  ShieldCheck
 } from 'lucide-react';
 
 interface CounterSalesViewProps {
@@ -32,12 +36,12 @@ export const CounterSalesView: React.FC<CounterSalesViewProps> = ({
   const [phone, setPhone] = useState<string>('');
   const [idNumber, setIdNumber] = useState<string>('');
   const [seatNumber, setSeatNumber] = useState<string>('04A');
-  const [paymentMode, setPaymentMode] = useState<'cash_counter' | 'orange_money' | 'wave'>('cash_counter');
+  const [paymentMode, setPaymentMode] = useState<PaymentProvider>('cash_counter');
   const [issuedBooking, setIssuedBooking] = useState<Booking | null>(null);
 
   const selectedTrip = trips.find((t) => t.id === selectedTripId) || trips[0];
 
-  const handleIssueTicket = (e: React.FormEvent) => {
+  const handleIssueTicket = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!firstName || !lastName || !idNumber) {
       alert('Veuillez renseigner le prénom, nom et le numéro de pièce du voyageur.');
@@ -46,19 +50,47 @@ export const CounterSalesView: React.FC<CounterSalesViewProps> = ({
 
     const randomSuffix = Math.floor(10000 + Math.random() * 90000);
     const pnr = `GCH-${randomSuffix}-${selectedTrip.originCity.substring(0, 3).toUpperCase()}`;
+    const bookingId = `counter_${Date.now()}`;
+
+    // Record formal payment transaction
+    const transaction = await createAndSaveTransaction({
+      bookingId,
+      pnr,
+      provider: paymentMode,
+      amountXOF: selectedTrip.basePriceXOF,
+      currency,
+      payerPhone: phone || '+223 70 00 00 00',
+      payerName: `${firstName} ${lastName}`,
+      providerReference: `GCH-POS-${Date.now()}`,
+      paymentMethodDetails: `Encaissement Guichet Gare : ${PAYMENT_PROVIDERS_CATALOG[paymentMode]?.name}`,
+    });
+
+    const sanitizedFirst = sanitizeInput(firstName);
+    const sanitizedLast = sanitizeInput(lastName);
+    const sanitizedId = sanitizeInput(idNumber);
+    const sanitizedPhone = sanitizeInput(phone) || '+223 70 00 00 00';
 
     const passenger: Passenger = {
-      firstName,
-      lastName,
-      phone: phone || '+223 70 00 00 00',
+      firstName: sanitizedFirst,
+      lastName: sanitizedLast,
+      phone: sanitizedPhone,
       idType: 'CARTE_NINA',
-      idNumber,
+      idNumber: sanitizedId,
       nationality: 'Malienne',
       seatNumber,
     };
 
+    const signature = await generateTicketSecuritySignature({
+      pnr,
+      tripId: selectedTrip.id,
+      departureDate: selectedTrip.departureDate,
+      seats: [seatNumber],
+      totalAmountXOF: selectedTrip.basePriceXOF,
+      passengerLastName: sanitizedLast,
+    });
+
     const newBooking: Booking = {
-      id: `counter_${Date.now()}`,
+      id: bookingId,
       pnr,
       tripId: selectedTrip.id,
       trip: selectedTrip,
@@ -69,8 +101,10 @@ export const CounterSalesView: React.FC<CounterSalesViewProps> = ({
       paymentStatus: 'completed',
       bookingDate: new Date().toISOString(),
       boardingStatus: 'not_boarded',
-      verificationHash: `guichet_${randomSuffix}_${lastName.toLowerCase()}`,
-      notes: 'Billet émis en guichet physique de gare.',
+      verificationHash: signature,
+      notes: `Billet émis en guichet physique de gare. Mode: ${PAYMENT_PROVIDERS_CATALOG[paymentMode]?.name}. Signature: ${signature}.`,
+      transactionId: transaction.id,
+      paymentReceiptNumber: transaction.receiptNumber,
     };
 
     saveBooking(newBooking);
@@ -197,29 +231,73 @@ export const CounterSalesView: React.FC<CounterSalesViewProps> = ({
               </div>
 
               <div>
-                <label className="block text-slate-600 font-medium mb-1">Encaissement</label>
-                <div className="grid grid-cols-2 gap-2">
+                <label className="block text-slate-600 font-medium mb-1">Moyen d'encaissement au guichet</label>
+                <div className="grid grid-cols-3 gap-1.5 text-[11px]">
                   <button
                     type="button"
                     onClick={() => setPaymentMode('cash_counter')}
-                    className={`p-2 rounded-lg border text-center font-semibold cursor-pointer ${
+                    className={`p-2 rounded-lg border text-center font-bold cursor-pointer transition-colors ${
                       paymentMode === 'cash_counter'
-                        ? 'bg-emerald-100 text-emerald-900 border-emerald-600'
-                        : 'bg-white border-slate-200 text-slate-600'
+                        ? 'bg-emerald-100 text-emerald-950 border-emerald-600'
+                        : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
                     }`}
                   >
-                    Espèces (Cash)
+                    💵 Espèces (Cash)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPaymentMode('wave')}
+                    className={`p-2 rounded-lg border text-center font-bold cursor-pointer transition-colors ${
+                      paymentMode === 'wave'
+                        ? 'bg-cyan-100 text-cyan-950 border-cyan-500'
+                        : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    🌊 Wave
                   </button>
                   <button
                     type="button"
                     onClick={() => setPaymentMode('orange_money')}
-                    className={`p-2 rounded-lg border text-center font-semibold cursor-pointer ${
+                    className={`p-2 rounded-lg border text-center font-bold cursor-pointer transition-colors ${
                       paymentMode === 'orange_money'
-                        ? 'bg-orange-100 text-orange-900 border-orange-600'
-                        : 'bg-white border-slate-200 text-slate-600'
+                        ? 'bg-orange-100 text-orange-950 border-orange-500'
+                        : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
                     }`}
                   >
-                    OM / Wave
+                    🟠 Orange Money
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPaymentMode('mtn_momo')}
+                    className={`p-2 rounded-lg border text-center font-bold cursor-pointer transition-colors ${
+                      paymentMode === 'mtn_momo'
+                        ? 'bg-amber-100 text-amber-950 border-amber-500'
+                        : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    🟡 MTN MoMo
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPaymentMode('moov_money')}
+                    className={`p-2 rounded-lg border text-center font-bold cursor-pointer transition-colors ${
+                      paymentMode === 'moov_money'
+                        ? 'bg-blue-100 text-blue-950 border-blue-500'
+                        : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    🔵 Moov / Flooz
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPaymentMode('card')}
+                    className={`p-2 rounded-lg border text-center font-bold cursor-pointer transition-colors ${
+                      paymentMode === 'card'
+                        ? 'bg-slate-200 text-slate-950 border-slate-600'
+                        : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    💳 Carte / TPE
                   </button>
                 </div>
               </div>

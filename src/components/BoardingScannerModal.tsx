@@ -15,8 +15,8 @@ import {
   Armchair,
   Volume2,
   Smartphone,
-  ShieldCheck
 } from 'lucide-react';
+import { extractPnrFromQrData } from '../utils/pnrExtractor';
 
 interface BoardingScannerModalProps {
   initialPnr?: string;
@@ -55,11 +55,14 @@ export const BoardingScannerModal: React.FC<BoardingScannerModalProps> = ({
   }, [initialPnr]);
 
   const handleInspect = (pnrToInspect: string) => {
+    const cleanPnr = extractPnrFromQrData(pnrToInspect);
+    if (!cleanPnr) return;
+
     // Check in live recentBookings first, fallback to storage
     const foundInLive = recentBookings.find(
-      (b) => b.pnr.toUpperCase() === pnrToInspect.trim().toUpperCase()
+      (b) => b.pnr.toUpperCase() === cleanPnr || b.pnr.replace(/-/g, '').toUpperCase() === cleanPnr.replace(/-/g, '')
     );
-    const booking = foundInLive || findBookingByPNR(pnrToInspect);
+    const booking = foundInLive || findBookingByPNR(cleanPnr);
     if (!booking) {
       setActiveBooking(null);
       setScanStatus('not_found');
