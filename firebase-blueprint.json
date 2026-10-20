@@ -1,0 +1,137 @@
+{
+  "entities": {
+    "booking": {
+      "title": "Booking",
+      "description": "Represents a passenger bus booking / electronic boarding pass",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "pnr": { "type": "string" },
+        "tripId": { "type": "string" },
+        "passengers": { "type": "array" },
+        "totalAmountXOF": { "type": "number" },
+        "currency": { "type": "string" },
+        "paymentProvider": { "type": "string" },
+        "paymentPhone": { "type": "string" },
+        "paymentStatus": { "type": "string" },
+        "bookingDate": { "type": "string" },
+        "boardingStatus": { "type": "string" },
+        "boardedAt": { "type": "string" },
+        "boardedByAgent": { "type": "string" },
+        "verificationHash": { "type": "string" },
+        "notes": { "type": "string" },
+        "trip": { "type": "object" },
+        "companyLogoUrl": { "type": "string" }
+      },
+      "required": ["pnr", "tripId", "passengers", "totalAmountXOF", "boardingStatus"]
+    },
+    "trip": {
+      "title": "Trip",
+      "description": "Represents an intercity or international scheduled bus departure",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "companyId": { "type": "string" },
+        "companyName": { "type": "string" },
+        "companyLogoUrl": { "type": "string" },
+        "originCity": { "type": "string" },
+        "originCountry": { "type": "string" },
+        "originStationId": { "type": "string" },
+        "originStationName": { "type": "string" },
+        "destinationCity": { "type": "string" },
+        "destinationCountry": { "type": "string" },
+        "destinationStationId": { "type": "string" },
+        "destinationStationName": { "type": "string" },
+        "departureTime": { "type": "string" },
+        "departureDate": { "type": "string" },
+        "arrivalTime": { "type": "string" },
+        "arrivalDate": { "type": "string" },
+        "durationHours": { "type": "number" },
+        "durationMinutes": { "type": "number" },
+        "distanceKm": { "type": "number" },
+        "basePriceXOF": { "type": "number" },
+        "busClass": { "type": "string" },
+        "busModel": { "type": "string" },
+        "plateNumber": { "type": "string" },
+        "totalSeats": { "type": "number" },
+        "availableSeats": { "type": "number" },
+        "isCrossBorder": { "type": "boolean" },
+        "amenities": { "type": "array" }
+      },
+      "required": ["companyName", "originCity", "destinationCity", "departureTime", "basePriceXOF"]
+    },
+    "company": {
+      "title": "BusCompany",
+      "description": "Partner bus transport operator",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "logoText": { "type": "string" },
+        "logoUrl": { "type": "string" },
+        "brandColor": { "type": "string" },
+        "rating": { "type": "number" },
+        "totalReviews": { "type": "number" },
+        "phone": { "type": "string" },
+        "headquarters": { "type": "string" },
+        "amenitiesDescription": { "type": "string" },
+        "verified": { "type": "boolean" }
+      },
+      "required": ["name", "logoText"]
+    },
+    "brandConfig": {
+      "title": "BrandConfig",
+      "description": "White-label platform branding configuration",
+      "type": "object",
+      "properties": {
+        "brandName": { "type": "string" },
+        "slogan": { "type": "string" },
+        "logoUrl": { "type": "string" },
+        "primaryColor": { "type": "string" },
+        "supportPhone": { "type": "string" },
+        "supportEmail": { "type": "string" },
+        "serviceFeeXOF": { "type": "number" },
+        "ticketNotice": { "type": "string" }
+      },
+      "required": ["brandName", "slogan"]
+    },
+    "user": {
+      "title": "UserAccount",
+      "description": "User account and role profile",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "role": { "type": "string" },
+        "phone": { "type": "string" },
+        "assignedStation": { "type": "string" },
+        "assignedCompanyName": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["uid", "email", "displayName", "role"]
+    }
+  },
+  "firestore": {
+    "/bookings/{bookingId}": {
+      "schema": { "$ref": "#/entities/booking" },
+      "description": "Live passenger bookings and boarding records"
+    },
+    "/trips/{tripId}": {
+      "schema": { "$ref": "#/entities/trip" },
+      "description": "Scheduled bus departures and real-time seat availability"
+    },
+    "/companies/{companyId}": {
+      "schema": { "$ref": "#/entities/company" },
+      "description": "Bus transport companies and their custom logos"
+    },
+    "/settings/brand": {
+      "schema": { "$ref": "#/entities/brandConfig" },
+      "description": "Global platform identity settings"
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/user" },
+      "description": "User profiles and controller agent assignments"
+    }
+  }
+}

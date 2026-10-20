@@ -1,0 +1,6 @@
+{
+  "name": "AFRIWAY — Billetterie Digitale Panafricaine",
+  "description": "Plateforme panafricaine de réservation et d'achat de billets de car interurbains et internationaux au Mali et en Afrique de l'Ouest.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

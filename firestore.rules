@@ -1,0 +1,53 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isValidString(val, maxLen) {
+      return val is string && val.size() <= maxLen;
+    }
+
+    // 1. Bookings collection (E-tickets, PNRs, Boarding status)
+    match /bookings/{bookingId} {
+      allow read: if true;
+      allow create: if request.resource.data.pnr is string 
+                    && request.resource.data.tripId is string
+                    && request.resource.data.totalAmountXOF is number;
+      allow update: if request.resource.data.pnr == resource.data.pnr;
+      allow delete: if false;
+    }
+
+    // 2. Scheduled Trips (Departures, seat occupancy)
+    match /trips/{tripId} {
+      allow read: if true;
+      allow create, update: if request.resource.data.companyName is string
+                            && request.resource.data.originCity is string
+                            && request.resource.data.destinationCity is string;
+      allow delete: if false;
+    }
+
+    // 3. Partner Bus Companies (Logos, HQ, Phone)
+    match /companies/{companyId} {
+      allow read: if true;
+      allow create, update: if request.resource.data.name is string;
+      allow delete: if false;
+    }
+
+    // 4. Global Brand Settings
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // 5. Authenticator User Accounts & Controller Profiles
+    match /users/{userId} {
+      allow read: if true;
+      allow create, update: if request.resource.data.email is string;
+      allow delete: if false;
+    }
+
+    // Default deny all other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
