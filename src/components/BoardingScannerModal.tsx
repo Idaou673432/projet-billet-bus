@@ -12,11 +12,13 @@ import {
   UserCheck, 
   Clock, 
   MapPin, 
-  Armchair,
   Volume2,
   Smartphone,
+  ShieldCheck,
+  ShieldAlert
 } from 'lucide-react';
 import { extractPnrFromQrData } from '../utils/pnrExtractor';
+import { verifyTicketIntegrity, checkRateLimit } from '../services/securityService';
 
 interface BoardingScannerModalProps {
   initialPnr?: string;
@@ -30,7 +32,8 @@ export const BoardingScannerModal: React.FC<BoardingScannerModalProps> = ({
 }) => {
   const [pnrInput, setPnrInput] = useState<string>(initialPnr);
   const [activeBooking, setActiveBooking] = useState<Booking | null>(null);
-  const [scanStatus, setScanStatus] = useState<'idle' | 'valid' | 'already_boarded' | 'not_found'>('idle');
+  const [scanStatus, setScanStatus] = useState<'idle' | 'valid' | 'already_boarded' | 'not_found' | 'fraud_tampered'>('idle');
+  const [securityMessage, setSecurityMessage] = useState<string>('');
   const [agentName] = useState<string>('Agent Contrôle Gare Sogoniko');
   const [isScanningCamera, setIsScanningCamera] = useState<boolean>(false);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -54,9 +57,16 @@ export const BoardingScannerModal: React.FC<BoardingScannerModalProps> = ({
     }
   }, [initialPnr]);
 
-  const handleInspect = (pnrToInspect: string) => {
+  const handleInspect = async (pnrToInspect: string) => {
     const cleanPnr = extractPnrFromQrData(pnrToInspect);
     if (!cleanPnr) return;
+
+    // Rate limit check
+    const rateCheck = checkRateLimit('modal_scanner');
+    if (!rateCheck.allowed) {
+      alert(`Trop de tentatives rapprochées. Veuillez patienter ${rateCheck.retryAfterSeconds}s.`);
+      return;
+    }
 
     // Check in live recentBookings first, fallback to storage
     const foundInLive = recentBookings.find(
@@ -66,10 +76,21 @@ export const BoardingScannerModal: React.FC<BoardingScannerModalProps> = ({
     if (!booking) {
       setActiveBooking(null);
       setScanStatus('not_found');
+      setSecurityMessage('Aucun billet enregistré pour ce code PNR.');
       return;
     }
 
     setActiveBooking(booking);
+
+    // Cryptographic signature check
+    const integrity = await verifyTicketIntegrity(booking);
+    setSecurityMessage(integrity.details);
+
+    if (!integrity.isValid) {
+      setScanStatus('fraud_tampered');
+      return;
+    }
+
     if (booking.boardingStatus === 'boarded') {
       setScanStatus('already_boarded');
     } else {
@@ -279,6 +300,20 @@ export const BoardingScannerModal: React.FC<BoardingScannerModalProps> = ({
                 Aucun billet correspondant au code PNR <strong>{pnrInput}</strong> n'a été trouvé dans le système officiel. Veuillez vérifier auprès du chef de gare.
               </p>
             </div>
+          ) : scanStatus === 'fraud_tampered' ? (
+            <div className="bg-red-950 rounded-2xl border-2 border-red-600 p-8 text-center space-y-3 text-white animate-in zoom-in-95">
+              <ShieldAlert className="w-14 h-14 text-red-500 mx-auto" />
+              <span className="text-[10px] font-bold uppercase tracking-wider text-red-200 bg-red-900 px-2 py-0.5 rounded border border-red-700">
+                CONTRÔLE CYBER-SÉCURITÉ ÉCHOUÉ
+              </span>
+              <h3 className="text-xl font-black text-white">ALERTE FRAUDE : SIGNATURE FALSIFIÉE !</h3>
+              <p className="text-xs text-red-200 max-w-md mx-auto">
+                {securityMessage || 'La signature cryptographique HMAC de ce billet ne correspond pas. Le billet a été contrefait ou altéré.'}
+              </p>
+              <div className="p-3 bg-slate-900 rounded-xl text-[11px] text-amber-300 font-mono border border-red-800">
+                Accès refusé. Veuillez orienter le voyageur vers la sécurité de quai ou le bureau des litiges.
+              </div>
+            </div>
           ) : activeBooking ? (
             <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs space-y-0">
               {/* Result Status Banner */}
@@ -304,6 +339,12 @@ export const BoardingScannerModal: React.FC<BoardingScannerModalProps> = ({
                         ? `Ce passager a déjà été enregistré le ${activeBooking.boardedAt ? new Date(activeBooking.boardedAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : ''} par ${activeBooking.boardedByAgent || 'Agent'}`
                         : 'Accès autorisé à bord du car'}
                     </p>
+                    {scanStatus === 'valid' && (
+                      <div className="text-[10px] text-emerald-100 flex items-center gap-1 mt-1 font-mono">
+                        <ShieldCheck className="w-3.5 h-3.5 text-emerald-300" />
+                        <span>{securityMessage || 'Signature Cryptographique SHA-256 HMAC Conforme'}</span>
+                      </div>
+                    )}
                   </div>
                 </div>
 

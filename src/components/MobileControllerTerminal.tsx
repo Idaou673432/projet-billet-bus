@@ -161,6 +161,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
   onOpenAuthModal,
 }) => {
   const [pnrInput, setPnrInput] = useState<string>('');
+  const [activeBooking, setActiveBooking] = useState<Booking | null>(null);
   const [scanStatus, setScanStatus] = useState<'idle' | 'valid' | 'already_boarded' | 'not_found' | 'fraud_tampered'>('idle');
   const [securityDetails, setSecurityDetails] = useState<string>('');
   const [isScanningCamera, setIsScanningCamera] = useState<boolean>(false);
@@ -538,7 +539,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
         pnr: booking.pnr,
         passengerName: `${booking.passengers[0]?.firstName} ${booking.passengers[0]?.lastName} [FRAUDE SIGNATURE]`,
         tripSummary: `${booking.trip.originCity} ➔ ${booking.trip.destinationCity}`,
-        seatNumber: booking.passengers.map(p => p.seatNumber).join(', '),
+        seatNumber: booking.passengers.map((p: any) => p.seatNumber).join(', '),
         status: 'invalid',
         agentName: currentUser.displayName,
         companyName: booking.trip.companyName,
@@ -554,7 +555,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
         pnr: booking.pnr,
         passengerName: `${booking.passengers[0]?.firstName} ${booking.passengers[0]?.lastName}`,
         tripSummary: `${booking.trip.originCity} ➔ ${booking.trip.destinationCity}`,
-        seatNumber: booking.passengers.map(p => p.seatNumber).join(', '),
+        seatNumber: booking.passengers.map((p: any) => p.seatNumber).join(', '),
         status: 'already_boarded',
         agentName: currentUser.displayName,
         companyName: booking.trip.companyName,
@@ -567,7 +568,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
         pnr: booking.pnr,
         passengerName: `${booking.passengers[0]?.firstName} ${booking.passengers[0]?.lastName}`,
         tripSummary: `${booking.trip.originCity} ➔ ${booking.trip.destinationCity}`,
-        seatNumber: booking.passengers.map(p => p.seatNumber).join(', '),
+        seatNumber: booking.passengers.map((p: any) => p.seatNumber).join(', '),
         status: 'valid',
         agentName: currentUser.displayName,
         companyName: booking.trip.companyName,
@@ -606,7 +607,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
       pnr: activeBooking.pnr,
       passengerName: `${activeBooking.passengers[0]?.firstName} ${activeBooking.passengers[0]?.lastName}`,
       tripSummary: `${activeBooking.trip.originCity} ➔ ${activeBooking.trip.destinationCity}`,
-      seatNumber: activeBooking.passengers.map(p => p.seatNumber).join(', '),
+      seatNumber: activeBooking.passengers.map((p: any) => p.seatNumber).join(', '),
       status: 'valid',
       agentName: currentUser.displayName,
       companyName: activeBooking.trip.companyName,
@@ -1506,6 +1507,31 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                   >
                     Test Billet Faux ❌
                   </button>
+
+                  {/* Tampered signature test button */}
+                  <button
+                    onClick={() => {
+                      if (recentBookings.length > 0) {
+                        const b = recentBookings[0];
+                        const tampered = { ...b, verificationHash: 'AFW-SEC-FORGED-TAMPERED-HASH-0000' };
+                        setActiveBooking(tampered);
+                        setScanStatus('fraud_tampered');
+                        setSecurityDetails('ALERTE : Données altérées ! La signature SHA-256 HMAC a été falsifiée.');
+                        playAudioBeep('error');
+                      } else {
+                        setPnrInput('AFW-FRAUDE-99');
+                        handleInspect('AFW-FRAUDE-99');
+                      }
+                    }}
+                    className={`px-2 py-1 text-[10px] font-mono font-bold rounded border transition-colors cursor-pointer text-amber-400 ${
+                      effectiveTheme === 'dark'
+                        ? 'bg-amber-950/40 border-amber-800 hover:bg-amber-900/60'
+                        : 'bg-amber-50 border-amber-300 hover:bg-amber-100 text-amber-800'
+                    }`}
+                    title="Simuler un QR code dont la signature cryptographique a été falsifiée"
+                  >
+                    Test Fraude Signature ⚠️
+                  </button>
                 </div>
               </div>
             </div>
@@ -1568,7 +1594,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                   <div>
                     <span className="text-[10px] text-slate-400 block">Siège(s)</span>
                     <span className="font-black text-amber-300 font-mono">
-                      Place {activeBooking.passengers.map(p => p.seatNumber).join(', ')}
+                      Place {activeBooking.passengers.map((p: any) => p.seatNumber).join(', ')}
                     </span>
                   </div>
                   <div>
@@ -1585,6 +1611,14 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                   </div>
                 </div>
 
+                {/* Cryptographic Security Seal */}
+                <div className="mt-3 flex items-center gap-1.5 text-[10px] font-mono text-emerald-300 bg-slate-900/90 p-2.5 rounded-xl border border-emerald-800">
+                  <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span className="truncate">
+                    {securityDetails || 'Signature Cryptographique Certifiée Conforme (SHA-256 HMAC)'}
+                  </span>
+                </div>
+
                 {/* Big Action Button to Validate Boarding */}
                 <button
                   onClick={handleConfirmBoarding}
@@ -1592,6 +1626,48 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                 >
                   <UserCheck className="w-5 h-5" />
                   <span>Valider l'Embarquement</span>
+                </button>
+              </div>
+            )}
+
+            {/* FRAUD / TAMPERED TICKET SECURITY ALERT */}
+            {scanStatus === 'fraud_tampered' && (
+              <div className="bg-red-950 border-4 border-red-600 rounded-2xl p-5 shadow-2xl animate-in zoom-in-95 duration-150 text-white space-y-3">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 rounded-full bg-red-600 text-white flex items-center justify-center shrink-0 shadow-lg">
+                    <ShieldAlert className="w-7 h-7" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-red-200 bg-red-900 px-2 py-0.5 rounded border border-red-700">
+                      ALERTE CYBER-SÉCURITÉ · FALSIFICATION DÉTECTÉE
+                    </span>
+                    <h4 className="text-xl font-black text-white mt-0.5">
+                      Signature Numérique Non Conforme !
+                    </h4>
+                  </div>
+                </div>
+
+                <div className="bg-slate-950/90 p-3.5 rounded-xl border border-red-800 text-xs text-red-200 space-y-2 font-mono">
+                  <p className="font-bold text-red-400 flex items-center gap-1.5">
+                    <ShieldAlert className="w-4 h-4" />
+                    <span>Ce QR code ou ce billet a été modifié frauduleusement.</span>
+                  </p>
+                  <p className="text-[11px] text-slate-300">
+                    {securityDetails || 'Le hachage cryptographique ne correspond pas aux paramètres officiels du billet.'}
+                  </p>
+                  <div className="pt-2 border-t border-red-900/60 text-amber-300 font-semibold text-[11px]">
+                    Action requise : Refuser l'accès à bord et orienter vers la sécurité de la gare.
+                  </div>
+                </div>
+
+                <button
+                  onClick={() => {
+                    setScanStatus('idle');
+                    setActiveBooking(null);
+                  }}
+                  className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-xl transition-colors cursor-pointer"
+                >
+                  Fermer l'alerte
                 </button>
               </div>
             )}
