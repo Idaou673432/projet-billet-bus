@@ -52,12 +52,22 @@ import {
   BadgeCheck,
   Smartphone,
   Download,
-  ShieldAlert
+  ShieldAlert,
+  Activity,
+  Cpu,
+  Radio
 } from 'lucide-react';
 import jsQR from 'jsqr';
 import { extractPnrFromQrData } from '../utils/pnrExtractor';
 import { verifyTicketIntegrity, checkRateLimit } from '../services/securityService';
 import { InstallAppModal } from './InstallAppModal';
+import {
+  initServiceWorkerNetworkMonitor,
+  subscribeToServiceWorkerNetwork,
+  probeNetworkConnectivity,
+  ServiceWorkerNetworkStatus,
+  getServiceWorkerNetworkSnapshot
+} from '../services/serviceWorkerNetwork';
 import {
   saveBookingsToControllerCache,
   getCachedBookingsForController,
@@ -162,7 +172,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
 }) => {
   const [pnrInput, setPnrInput] = useState<string>('');
   const [activeBooking, setActiveBooking] = useState<Booking | null>(null);
-  const [scanStatus, setScanStatus] = useState<'idle' | 'valid' | 'already_boarded' | 'not_found' | 'fraud_tampered'>('idle');
+  const [scanStatus, setScanStatus] = useState<'idle' | 'valid' | 'auto_approved' | 'already_boarded' | 'not_found' | 'fraud_tampered'>('idle');
   const [securityDetails, setSecurityDetails] = useState<string>('');
   const [isScanningCamera, setIsScanningCamera] = useState<boolean>(false);
   const [cameraFacingMode, setCameraFacingMode] = useState<'environment' | 'user'>('environment');
@@ -171,6 +181,24 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
   const [isAnalyzingImage, setIsAnalyzingImage] = useState<boolean>(false);
   const [isProfileModalOpen, setIsProfileModalOpen] = useState<boolean>(false);
   const [isInstallModalOpen, setIsInstallModalOpen] = useState<boolean>(false);
+
+  // Auto-Approve directly upon scanning (User request: scan instantly approves tickets)
+  const [autoApprove, setAutoApprove] = useState<boolean>(() => {
+    try {
+      const stored = localStorage.getItem('afriway_controller_auto_approve_v1');
+      if (stored !== null) return stored === 'true';
+    } catch {}
+    return true; // Default ON: instant direct approval without manual verification button
+  });
+
+  // Visual Verification Progress Bar states
+  const [isVerifying, setIsVerifying] = useState<boolean>(false);
+  const [verificationProgress, setVerificationProgress] = useState<number | null>(null);
+  const [verificationStage, setVerificationStage] = useState<string>('');
+  const [autoApprovedBooking, setAutoApprovedBooking] = useState<Booking | null>(null);
+  const [nextScanCountdown, setNextScanCountdown] = useState<number | null>(null);
+  const countdownIntervalRef = useRef<any>(null);
+  const autoClearTimerRef = useRef<any>(null);
   const scanLoopActiveRef = useRef<boolean>(false);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const animFrameIdRef = useRef<number | null>(null);
@@ -178,6 +206,13 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
   const lastDetectedTimeRef = useRef<number>(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+  const [hapticsEnabled, setHapticsEnabled] = useState<boolean>(() => {
+    try {
+      const stored = localStorage.getItem('afriway_controller_haptics_v1');
+      if (stored !== null) return stored === 'true';
+    } catch {}
+    return true; // Default ON: strong vibration for noisy terminals
+  });
   const [selectedTripFilter, setSelectedTripFilter] = useState<string>('all');
   const [scanHistory, setScanHistory] = useState<ScanLogRecord[]>(getStoredScanHistory);
   const [terminalTab, setTerminalTab] = useState<'scan' | 'history'>('scan');
@@ -188,6 +223,8 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
   const [recentBookings, setRecentBookings] = useState<Booking[]>([]);
   const [lastScannedPnr, setLastScannedPnr] = useState<string>('');
   const [isOnline, setIsOnline] = useState<boolean>(() => typeof navigator !== 'undefined' ? navigator.onLine : true);
+  const [swNetwork, setSwNetwork] = useState<ServiceWorkerNetworkStatus>(getServiceWorkerNetworkSnapshot);
+  const [isProbingLive, setIsProbingLive] = useState<boolean>(false);
   const [cacheMeta, setCacheMeta] = useState<ControllerCacheMetadata>(getControllerCacheMetadata);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
@@ -322,8 +359,32 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
 
-  // 1. Online / Offline network listeners & auto-sync queue processing
+  // Manual probe function to test connection live with ping
+  const handleManualProbe = async () => {
+    setIsProbingLive(true);
+    try {
+      const res = await probeNetworkConnectivity();
+      if (res.isOnline) {
+        setSyncNotice(`✅ Connecté au Cloud · Latence : ${res.latencyMs || 0} ms`);
+      } else {
+        setSyncNotice('⚡ Mode Hors-Ligne détecté : Service Worker actif sur cache local.');
+      }
+    } catch {
+      setSyncNotice('Test réseau terminé.');
+    } finally {
+      setIsProbingLive(false);
+      setTimeout(() => setSyncNotice(null), 3500);
+    }
+  };
+
+  // 1. Service Worker & Network Real-Time Monitor with Auto-Sync Queue Processing
   useEffect(() => {
+    const stopSWMonitor = initServiceWorkerNetworkMonitor();
+    const unsubscribeSW = subscribeToServiceWorkerNetwork((status) => {
+      setSwNetwork(status);
+      setIsOnline(status.isOnline);
+    });
+
     const handleOnline = async () => {
       setIsOnline(true);
       setSyncNotice('Réseau détecté. Synchronisation du cache...');
@@ -344,7 +405,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
       setIsOnline(false);
       setCacheMeta(getControllerCacheMetadata());
       setPendingQueue(getPendingOfflineQueue());
-      setSyncNotice('⚡ Mode Hors-Ligne activé : validation sur cache local.');
+      setSyncNotice('⚡ Mode Hors-Ligne détecté : Le Service Worker prend le relais avec le cache local.');
       setTimeout(() => setSyncNotice(null), 4000);
     };
 
@@ -352,6 +413,8 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     window.addEventListener('offline', handleOffline);
 
     return () => {
+      stopSWMonitor();
+      unsubscribeSW();
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
@@ -398,7 +461,29 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     }
   };
 
-  // Web Audio Chime generator for instant mobile audio feedback
+  // High-penetration haptic vibration feedback for noisy African bus terminals
+  const triggerHapticFeedback = (type: 'success' | 'warning' | 'error') => {
+    if (!hapticsEnabled) return;
+    if (typeof navigator === 'undefined' || !navigator.vibrate) return;
+
+    try {
+      if (type === 'success') {
+        // High-impact sharp double pulse: 120ms sharp buzz, 40ms pause, 180ms confirming buzz
+        // Distinct, impossible to miss even in pockets or with vibrations of moving buses
+        navigator.vibrate([120, 40, 180]);
+      } else if (type === 'warning') {
+        // Three rapid rhythmic cautionary pulses
+        navigator.vibrate([140, 60, 140, 60, 140]);
+      } else {
+        // Long harsh error buzz
+        navigator.vibrate([350]);
+      }
+    } catch (e) {
+      console.warn('Haptic vibration failed:', e);
+    }
+  };
+
+  // High-penetration acoustic chime generator tuned for noisy bus terminals (diesel engines & crowd)
   const playAudioBeep = (type: 'success' | 'warning' | 'error') => {
     if (!soundEnabled) return;
     try {
@@ -412,41 +497,117 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
         ctx.resume();
       }
 
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
+      const now = ctx.currentTime;
 
       if (type === 'success') {
-        // High melodic double chime (Valid ticket)
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
-        osc.frequency.setValueAtTime(880, ctx.currentTime + 0.1); // A5
-        gain.gain.setValueAtTime(0.2, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.35);
-        osc.start();
-        osc.stop(ctx.currentTime + 0.35);
+        // Piercing dual harmonic bell chime: Note 1 (B5 987.77 Hz) -> Note 2 (E6 1318.51 Hz) + overtone (E7 2637 Hz)
+        // High frequencies cut right through the low ambient rumble of engines and bustling passenger crowds
+        const osc1 = ctx.createOscillator();
+        const osc2 = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        osc1.type = 'sine';
+        osc1.frequency.setValueAtTime(987.77, now); // B5 note
+        osc1.frequency.setValueAtTime(1318.51, now + 0.07); // E6 note
+
+        osc2.type = 'triangle'; // Harmonic overtone
+        osc2.frequency.setValueAtTime(1975.53, now); // B6 overtone
+        osc2.frequency.setValueAtTime(2637.02, now + 0.07); // E7 overtone
+
+        gain.gain.setValueAtTime(0.35, now);
+        gain.gain.exponentialRampToValueAtTime(0.005, now + 0.25);
+
+        osc1.connect(gain);
+        osc2.connect(gain);
+        gain.connect(ctx.destination);
+
+        osc1.start(now);
+        osc2.start(now);
+        osc1.stop(now + 0.25);
+        osc2.stop(now + 0.25);
       } else if (type === 'warning') {
-        // Low double alert tone (Already boarded)
+        // Rapid dual cautionary alert tone
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
         osc.type = 'sawtooth';
-        osc.frequency.setValueAtTime(260, ctx.currentTime);
-        osc.frequency.setValueAtTime(200, ctx.currentTime + 0.15);
-        gain.gain.setValueAtTime(0.25, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.4);
-        osc.start();
-        osc.stop(ctx.currentTime + 0.4);
+        osc.frequency.setValueAtTime(320, now);
+        osc.frequency.setValueAtTime(240, now + 0.1);
+        gain.gain.setValueAtTime(0.3, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.35);
+        osc.start(now);
+        osc.stop(now + 0.35);
       } else {
-        // Low harsh buzz (Invalid/not found)
+        // Low harsh buzz for invalid or tampered tickets
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
         osc.type = 'square';
-        osc.frequency.setValueAtTime(150, ctx.currentTime);
-        gain.gain.setValueAtTime(0.3, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
-        osc.start();
-        osc.stop(ctx.currentTime + 0.5);
+        osc.frequency.setValueAtTime(160, now);
+        gain.gain.setValueAtTime(0.35, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.45);
+        osc.start(now);
+        osc.stop(now + 0.45);
       }
     } catch (e) {
       // Audio autoplay policy fallback
     }
+  };
+
+  // Toggle Haptic Vibration on/off
+  const handleToggleHaptics = () => {
+    const nextVal = !hapticsEnabled;
+    setHapticsEnabled(nextVal);
+    try {
+      localStorage.setItem('afriway_controller_haptics_v1', String(nextVal));
+    } catch {}
+    if (nextVal && typeof navigator !== 'undefined' && navigator.vibrate) {
+      navigator.vibrate([120, 40, 180]);
+    }
+    setSyncNotice(nextVal ? '📳 Vibration haptique ACTIVÉE (confirmation ressentie)' : 'Vibration désactivée');
+    setTimeout(() => setSyncNotice(null), 2500);
+  };
+
+  // Test both sound & vibration simultaneously
+  const handleTestAudioAndHaptics = () => {
+    triggerHapticFeedback('success');
+    playAudioBeep('success');
+    setSyncNotice('🔊 Signal sonore perçant (1318Hz) + 📳 Double vibration émis !');
+    setTimeout(() => setSyncNotice(null), 3000);
+  };
+
+  // Toggle Auto-Approval on/off
+  const handleToggleAutoApprove = () => {
+    const nextVal = !autoApprove;
+    setAutoApprove(nextVal);
+    try {
+      localStorage.setItem('afriway_controller_auto_approve_v1', String(nextVal));
+    } catch {}
+    setSyncNotice(nextVal ? '⚡ Auto-Approbation ACTIVÉE : scan = embarquement direct immédiat' : 'Validation Manuelle : vérification avant clic');
+    setTimeout(() => setSyncNotice(null), 3000);
+  };
+
+  // Immediate Reset to scan next passenger without waiting for timer
+  const handleScanNextPassenger = () => {
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    if (autoClearTimerRef.current) {
+      clearTimeout(autoClearTimerRef.current);
+      autoClearTimerRef.current = null;
+    }
+    setNextScanCountdown(null);
+    setScanStatus('idle');
+    setActiveBooking(null);
+    setAutoApprovedBooking(null);
+    setPnrInput('');
+    setIsVerifying(false);
+    setVerificationProgress(null);
   };
 
   // Handle raw QR code detection with debounce, sound, haptics and inspection
@@ -455,9 +616,9 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     const cleanPnr = extractPnrFromQrData(rawCode);
     if (!cleanPnr) return;
 
-    // Debounce repeated triggers of the same QR code
+    // Debounce repeated triggers of the exact same QR code within 2 seconds
     const now = Date.now();
-    if (cleanPnr === lastDetectedPnrRef.current && now - lastDetectedTimeRef.current < 2200) {
+    if (cleanPnr === lastDetectedPnrRef.current && now - lastDetectedTimeRef.current < 2000) {
       return;
     }
     lastDetectedPnrRef.current = cleanPnr;
@@ -465,33 +626,52 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
 
     // Visual scan flash
     setScanSuccessFlash(true);
-    setTimeout(() => setScanSuccessFlash(false), 800);
+    setTimeout(() => setScanSuccessFlash(false), 600);
 
-    // Haptic feedback
-    if (typeof navigator !== 'undefined' && navigator.vibrate) {
-      try {
-        navigator.vibrate([70, 40, 70]);
-      } catch {}
-    }
+    // Haptic feedback & initial chime
+    triggerHapticFeedback('success');
 
     setPnrInput(cleanPnr);
     handleInspect(cleanPnr);
   };
 
-  // Inspect ticket by PNR with Cryptographic Integrity Check and Offline Cache Fallback
+  // Inspect ticket by PNR with Animated Progress Bar and Direct Auto-Approval
   const handleInspect = async (pnrToInspect: string) => {
     const cleanPnr = extractPnrFromQrData(pnrToInspect);
     if (!cleanPnr) return;
 
+    // Clear any previous countdown interval
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    if (autoClearTimerRef.current) {
+      clearTimeout(autoClearTimerRef.current);
+      autoClearTimerRef.current = null;
+    }
+    setNextScanCountdown(null);
+
+    // Start Visual Progress Bar
+    setIsVerifying(true);
+    setVerificationProgress(20);
+    setVerificationStage('Lecture du QR Code & PNR...');
+
     // Anti-Brute-Force rate limiter
     const rateCheck = checkRateLimit('scanner_terminal');
     if (!rateCheck.allowed) {
+      setIsVerifying(false);
+      setVerificationProgress(null);
       setSyncNotice(`⚠️ Anti-Brute-Force actif : attente requise ${rateCheck.retryAfterSeconds}s.`);
       playAudioBeep('error');
       return;
     }
 
     setLastScannedPnr(cleanPnr);
+
+    // Progress animation step 1 (60ms)
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    setVerificationProgress(50);
+    setVerificationStage('Contrôle signature SHA-256 HMAC...');
 
     // 1. Check in-memory bookings
     let booking = recentBookings.find(
@@ -509,10 +689,19 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     }
 
     if (!booking) {
+      setVerificationProgress(100);
+      setVerificationStage('❌ Billet introuvable en base');
+      setTimeout(() => {
+        setIsVerifying(false);
+        setVerificationProgress(null);
+      }, 500);
+
       setActiveBooking(null);
+      setAutoApprovedBooking(null);
       setScanStatus('not_found');
       setSecurityDetails('Aucune correspondance en base de données.');
       playAudioBeep('error');
+      triggerHapticFeedback('error');
       recordScanToHistory({
         pnr: cleanPnr,
         passengerName: 'Billet Introuvable / Erroné',
@@ -528,13 +717,25 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
 
     setActiveBooking(booking);
 
-    // 4. Cryptographic Digital Signature & Anti-Fraud Verification
+    // Progress animation step 2: Cryptographic Digital Signature & Anti-Fraud
     const integrity = await verifyTicketIntegrity(booking);
     setSecurityDetails(integrity.details);
 
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    setVerificationProgress(85);
+    setVerificationStage('Contrôle validité & anti-fraude...');
+
     if (!integrity.isValid) {
+      setVerificationProgress(100);
+      setVerificationStage('🚨 Falsification détectée !');
+      setTimeout(() => {
+        setIsVerifying(false);
+        setVerificationProgress(null);
+      }, 600);
+
       setScanStatus('fraud_tampered');
       playAudioBeep('error');
+      triggerHapticFeedback('error');
       recordScanToHistory({
         pnr: booking.pnr,
         passengerName: `${booking.passengers[0]?.firstName} ${booking.passengers[0]?.lastName} [FRAUDE SIGNATURE]`,
@@ -549,8 +750,16 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     }
 
     if (booking.boardingStatus === 'boarded') {
+      setVerificationProgress(100);
+      setVerificationStage('⚠️ Billet déjà embarqué');
+      setTimeout(() => {
+        setIsVerifying(false);
+        setVerificationProgress(null);
+      }, 600);
+
       setScanStatus('already_boarded');
       playAudioBeep('warning');
+      triggerHapticFeedback('warning');
       recordScanToHistory({
         pnr: booking.pnr,
         passengerName: `${booking.passengers[0]?.firstName} ${booking.passengers[0]?.lastName}`,
@@ -561,9 +770,25 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
         companyName: booking.trip.companyName,
         syncMode: isOnline ? 'cloud' : 'offline_cache',
       });
+      return;
+    }
+
+    // Ticket is 100% valid!
+    setVerificationProgress(100);
+    setVerificationStage(autoApprove ? '⚡ Billet Authentifié : Embarquement Automatique...' : '✅ Billet Authentifié et Conforme');
+    setTimeout(() => {
+      setIsVerifying(false);
+      setVerificationProgress(null);
+    }, 500);
+
+    // If AUTO-APPROVE is active (default), execute boarding directly!
+    if (autoApprove) {
+      executeBoarding(booking, true);
     } else {
+      // Manual approval mode: display verified ticket and wait for controller button
       setScanStatus('valid');
       playAudioBeep('success');
+      triggerHapticFeedback('success');
       recordScanToHistory({
         pnr: booking.pnr,
         passengerName: `${booking.passengers[0]?.firstName} ${booking.passengers[0]?.lastName}`,
@@ -577,14 +802,13 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     }
   };
 
-  // Confirm Boarding Action (Offline-Resilient with Auto-Sync Queue)
-  const handleConfirmBoarding = () => {
-    if (!activeBooking) return;
+  // Execute Boarding (used by both instant auto-approval and manual confirmation)
+  const executeBoarding = (bookingToBoard: Booking, isAuto: boolean = false) => {
     const agentLabel = `${currentUser.displayName} (${currentUser.assignedStation || 'Contrôleur Quai'})`;
     
     // 1. Update local cache immediately (works 100% offline)
     const { updatedBooking, queuedOffline } = updateBoardingInControllerCache(
-      activeBooking.pnr,
+      bookingToBoard.pnr,
       'boarded',
       agentLabel,
       forcedOffline
@@ -595,32 +819,60 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
 
     // 2. If online and not forced offline, also send to Firebase Cloud
     if (effectiveIsOnline && navigator.onLine) {
-      updateBoardingStatusInCloud(activeBooking.id, 'boarded', agentLabel).catch((err) => {
+      updateBoardingStatusInCloud(bookingToBoard.id, 'boarded', agentLabel).catch((err) => {
         console.warn('Cloud update fallback to offline queue:', err);
       });
     }
 
+    // Piercing acoustic chime & double-buzz haptic confirmation for loud bus terminals
     playAudioBeep('success');
+    triggerHapticFeedback('success');
 
     // 3. Record confirmed boarding into the 20-items rolling history
     recordScanToHistory({
-      pnr: activeBooking.pnr,
-      passengerName: `${activeBooking.passengers[0]?.firstName} ${activeBooking.passengers[0]?.lastName}`,
-      tripSummary: `${activeBooking.trip.originCity} ➔ ${activeBooking.trip.destinationCity}`,
-      seatNumber: activeBooking.passengers.map((p: any) => p.seatNumber).join(', '),
+      pnr: bookingToBoard.pnr,
+      passengerName: `${bookingToBoard.passengers[0]?.firstName} ${bookingToBoard.passengers[0]?.lastName}`,
+      tripSummary: `${bookingToBoard.trip.originCity} ➔ ${bookingToBoard.trip.destinationCity}`,
+      seatNumber: bookingToBoard.passengers.map((p: any) => p.seatNumber).join(', '),
       status: 'valid',
       agentName: currentUser.displayName,
-      companyName: activeBooking.trip.companyName,
+      companyName: bookingToBoard.trip.companyName,
       syncMode: queuedOffline || !effectiveIsOnline ? 'offline_cache' : 'cloud',
     });
 
-    if (updatedBooking) {
-      setActiveBooking(updatedBooking);
-      setScanStatus('already_boarded');
-      setRecentBookings(getCachedBookingsForController());
-      setCacheMeta(getControllerCacheMetadata());
-      setPendingQueue(getPendingOfflineQueue());
+    const finalBooking = updatedBooking || { ...bookingToBoard, boardingStatus: 'boarded' as const };
+    setActiveBooking(finalBooking);
+    setAutoApprovedBooking(finalBooking);
+    setScanStatus(isAuto ? 'auto_approved' : 'already_boarded');
+    setRecentBookings(getCachedBookingsForController());
+    setCacheMeta(getControllerCacheMetadata());
+    setPendingQueue(getPendingOfflineQueue());
+
+    if (isAuto) {
+      // Auto-clear countdown for seamless queue flow (3 seconds)
+      let secondsRemaining = 3;
+      setNextScanCountdown(secondsRemaining);
+      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = setInterval(() => {
+        secondsRemaining -= 1;
+        if (secondsRemaining <= 0) {
+          clearInterval(countdownIntervalRef.current);
+          countdownIntervalRef.current = null;
+          setNextScanCountdown(null);
+          setScanStatus('idle');
+          setActiveBooking(null);
+          setAutoApprovedBooking(null);
+        } else {
+          setNextScanCountdown(secondsRemaining);
+        }
+      }, 1000);
     }
+  };
+
+  // Manual button click confirmation
+  const handleConfirmBoarding = () => {
+    if (!activeBooking) return;
+    executeBoarding(activeBooking, false);
   };
 
   // Reset status (for testing or supervisor override)
@@ -818,12 +1070,23 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     e.target.value = '';
   };
 
-  // Clean camera tracks on unmount
+  // Clean camera tracks and countdown timers on unmount
   useEffect(() => {
     return () => {
       stopCamera();
+      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+      if (autoClearTimerRef.current) clearTimeout(autoClearTimerRef.current);
     };
   }, []);
+
+  // Seamless Auto-Start Camera when Controller opens scan tab (0-click ready to scan)
+  useEffect(() => {
+    if (terminalTab === 'scan' && !isScanningCamera) {
+      startCamera().catch(() => {});
+    } else if (terminalTab !== 'scan' && isScanningCamera) {
+      stopCamera();
+    }
+  }, [terminalTab]);
 
   // Filtered manifest calculations
   const filteredBookings = selectedTripFilter === 'all'
@@ -924,25 +1187,43 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
         </div>
 
         <div className="flex items-center gap-1.5 sm:gap-2">
-          {/* Network & Offline Center Button */}
+          {/* Real-Time Network & Service Worker Connectivity Indicator */}
           <button
             onClick={() => setIsOfflineModalOpen(true)}
-            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-bold border transition-colors cursor-pointer ${
+            className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 rounded-lg text-xs font-bold border transition-all cursor-pointer shadow-xs ${
               effectiveIsOnline
-                ? 'bg-emerald-950/80 text-emerald-300 border-emerald-800 hover:bg-emerald-900'
-                : 'bg-amber-950/80 text-amber-300 border-amber-700 hover:bg-amber-900'
+                ? 'bg-emerald-950/85 text-emerald-300 border-emerald-700/80 hover:bg-emerald-900'
+                : 'bg-amber-950/90 text-amber-300 border-amber-600 hover:bg-amber-900 animate-pulse'
             }`}
-            title="Ouvrir le Centre Hors-Ligne & Gestion du Cache"
+            title={`Connectivité Réseau : ${effectiveIsOnline ? 'EN LIGNE (Synchronisation Cloud active)' : 'HORS-LIGNE (Relais Service Worker actif sur cache local)'}`}
           >
             {isSyncing ? (
               <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-300" />
             ) : effectiveIsOnline ? (
-              <Wifi className="w-3.5 h-3.5 text-emerald-400" />
+              <div className="flex items-center gap-1">
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                </span>
+                <Wifi className="w-3.5 h-3.5 text-emerald-400" />
+              </div>
             ) : (
-              <WifiOff className="w-3.5 h-3.5 text-amber-400" />
+              <div className="flex items-center gap-1">
+                <span className="relative flex h-2 w-2">
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-400"></span>
+                </span>
+                <WifiOff className="w-3.5 h-3.5 text-amber-400" />
+              </div>
             )}
-            <span className="hidden xs:inline">
-              {effectiveIsOnline ? 'En Ligne' : 'Hors-Ligne'}
+            <span className="font-mono text-[11px] font-black">
+              {effectiveIsOnline ? (swNetwork.latencyMs ? `${swNetwork.latencyMs}ms` : 'En Ligne') : 'Hors-Ligne'}
+            </span>
+            <span className={`px-1.5 py-0.2 text-[9px] rounded font-mono font-bold uppercase hidden xs:inline border ${
+              effectiveIsOnline 
+                ? 'bg-emerald-900/90 text-emerald-300 border-emerald-600/60' 
+                : 'bg-amber-900 text-amber-200 border-amber-600'
+            }`}>
+              {effectiveIsOnline ? (swNetwork.swControlled ? 'SW Actif' : 'Cloud') : 'SW PWA'}
             </span>
             {cacheMeta.pendingSyncCount > 0 && (
               <span className="px-1.5 py-0.2 bg-amber-500 text-slate-950 text-[10px] font-black rounded-full animate-bounce">
@@ -1241,35 +1522,36 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
           </div>
 
           {/* MAIN SCANNING INTERFACE */}
-          <main className="flex-1 max-w-lg w-full mx-auto p-4 space-y-4">
+          <main className="flex-1 max-w-lg w-full mx-auto p-2 sm:p-4 space-y-3">
             
-            {/* Phone Camera Scanner Card with Real-Time QR Engine */}
-            <div className={`rounded-2xl border p-4 shadow-xl overflow-hidden transition-colors ${
+            {/* Phone Camera Scanner Card with Maximum Screen Viewport and Integrated Progress Bar */}
+            <div className={`rounded-2xl border p-3 sm:p-4 shadow-xl overflow-hidden transition-colors ${
               effectiveTheme === 'dark'
                 ? 'bg-slate-800/90 border-slate-700 text-slate-100 shadow-black/40'
                 : 'bg-white border-slate-200 text-slate-900 shadow-md'
             }`}>
-              <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                <div className="flex items-center gap-2">
-                  <div className="w-6 h-6 rounded-lg bg-emerald-600/20 text-emerald-500 flex items-center justify-center">
+              {/* Camera Header Toolbar */}
+              <div className="flex items-center justify-between gap-2 mb-2.5">
+                <div className="flex items-center gap-2 min-w-0">
+                  <div className="w-7 h-7 rounded-lg bg-emerald-600/20 text-emerald-500 flex items-center justify-center shrink-0">
                     <Scan className="w-4 h-4 text-emerald-500" />
                   </div>
-                  <div>
-                    <h3 className={`text-xs font-black uppercase tracking-wider flex items-center gap-1.5 ${
+                  <div className="min-w-0">
+                    <h3 className={`text-xs font-black uppercase tracking-wider flex items-center gap-1.5 truncate ${
                       effectiveTheme === 'dark' ? 'text-slate-100' : 'text-slate-900'
                     }`}>
-                      <span>Scanner Téléphone Contrôleur</span>
+                      <span>Viseur Caméra</span>
                       {isScanningCamera && (
-                        <span className="inline-flex items-center px-1.5 py-0.2 rounded-full text-[9px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 animate-pulse">
-                          Live Active
+                        <span className="inline-flex items-center px-1.5 py-0.2 rounded-full text-[9px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 animate-pulse shrink-0">
+                          Live
                         </span>
                       )}
                     </h3>
                   </div>
                 </div>
 
-                {/* Toolbar Buttons: Torch, Flip, File Upload, Camera Toggle */}
-                <div className="flex items-center gap-1.5 flex-wrap">
+                {/* Toolbar Buttons: Auto-Approve Pill, Torch, Flip, File Upload, Camera Toggle */}
+                <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
                   {/* Photo / Screenshot Upload Scan */}
                   <input
                     ref={fileInputRef}
@@ -1281,7 +1563,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                   <button
                     onClick={() => fileInputRef.current?.click()}
                     disabled={isAnalyzingImage}
-                    className={`px-2 py-1 text-xs font-bold rounded-lg flex items-center gap-1 transition-all cursor-pointer border ${
+                    className={`p-1.5 sm:px-2 sm:py-1 text-xs font-bold rounded-lg flex items-center gap-1 transition-all cursor-pointer border ${
                       effectiveTheme === 'dark'
                         ? 'bg-slate-700 border-slate-600 text-slate-200 hover:text-white hover:bg-slate-600'
                         : 'bg-slate-100 border-slate-300 text-slate-700 hover:text-slate-900 hover:bg-slate-200'
@@ -1293,7 +1575,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                     ) : (
                       <ImageIcon className="w-3.5 h-3.5 text-emerald-500" />
                     )}
-                    <span className="hidden sm:inline">Photo QR</span>
+                    <span className="hidden sm:inline">Photo</span>
                   </button>
 
                   {/* Switch Front/Rear Camera if scanning */}
@@ -1314,7 +1596,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                   {/* Hardware Torch / Screen Light Toggle */}
                   <button
                     onClick={toggleTorch}
-                    className={`px-2 py-1 text-xs font-bold rounded-lg flex items-center gap-1 transition-all cursor-pointer border ${
+                    className={`p-1.5 sm:px-2 sm:py-1 text-xs font-bold rounded-lg flex items-center gap-1 transition-all cursor-pointer border ${
                       isTorchOn
                         ? 'bg-amber-400 text-slate-950 border-amber-300 font-black shadow-[0_0_10px_rgba(251,191,36,0.6)] animate-pulse'
                         : effectiveTheme === 'dark'
@@ -1324,13 +1606,47 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                     title={isTorchOn ? 'Éteindre la torche' : 'Allumer la torche (scan nocturne/quai)'}
                   >
                     <Flashlight className={`w-3.5 h-3.5 ${isTorchOn ? 'fill-amber-400' : ''}`} />
-                    <span className="hidden xs:inline">{isTorchOn ? 'Torche ON' : 'Torche'}</span>
+                    <span className="hidden sm:inline">{isTorchOn ? 'Torche' : 'Torche'}</span>
+                  </button>
+
+                  {/* Audio Beep Mute Toggle */}
+                  <button
+                    onClick={() => setSoundEnabled(!soundEnabled)}
+                    className={`p-1.5 text-xs font-bold rounded-lg border transition-all cursor-pointer ${
+                      soundEnabled
+                        ? effectiveTheme === 'dark'
+                          ? 'bg-slate-700 border-slate-600 text-emerald-400'
+                          : 'bg-slate-100 border-slate-300 text-emerald-600'
+                        : effectiveTheme === 'dark'
+                        ? 'bg-slate-800 border-slate-700 text-slate-500'
+                        : 'bg-slate-100 border-slate-300 text-slate-400'
+                    }`}
+                    title={soundEnabled ? 'Bip sonore activé' : 'Bip sonore désactivé'}
+                  >
+                    {soundEnabled ? <Volume2 className="w-3.5 h-3.5" /> : <VolumeX className="w-3.5 h-3.5" />}
+                  </button>
+
+                  {/* Haptic Vibration Toggle */}
+                  <button
+                    onClick={handleToggleHaptics}
+                    className={`p-1.5 text-xs font-bold rounded-lg border transition-all cursor-pointer ${
+                      hapticsEnabled
+                        ? effectiveTheme === 'dark'
+                          ? 'bg-slate-700 border-slate-600 text-amber-400'
+                          : 'bg-slate-100 border-slate-300 text-amber-600'
+                        : effectiveTheme === 'dark'
+                        ? 'bg-slate-800 border-slate-700 text-slate-500'
+                        : 'bg-slate-100 border-slate-300 text-slate-400'
+                    }`}
+                    title={hapticsEnabled ? 'Vibreur haptique activé (double buzz quai)' : 'Vibreur désactivé'}
+                  >
+                    <Smartphone className={`w-3.5 h-3.5 ${hapticsEnabled ? 'animate-pulse' : ''}`} />
                   </button>
 
                   {/* Camera ON / OFF Button */}
                   <button
                     onClick={toggleCamera}
-                    className={`px-3 py-1.5 text-xs font-black rounded-lg flex items-center gap-1.5 transition-all cursor-pointer shadow-md ${
+                    className={`px-2.5 sm:px-3 py-1.5 text-xs font-black rounded-lg flex items-center gap-1.5 transition-all cursor-pointer shadow-md shrink-0 ${
                       isScanningCamera 
                         ? 'bg-rose-600 hover:bg-rose-700 text-white' 
                         : 'bg-emerald-600 hover:bg-emerald-500 text-white'
@@ -1339,12 +1655,12 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                     {isScanningCamera ? (
                       <>
                         <CameraOff className="w-3.5 h-3.5" />
-                        <span>Arrêter</span>
+                        <span>Stop</span>
                       </>
                     ) : (
                       <>
                         <Camera className="w-3.5 h-3.5" />
-                        <span>Activer Caméra</span>
+                        <span>Activer</span>
                       </>
                     )}
                   </button>
@@ -1353,7 +1669,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
 
               {/* Camera Error Message */}
               {cameraError && (
-                <div className="mb-3 p-2.5 rounded-xl bg-rose-950/40 border border-rose-800 text-rose-300 text-xs flex items-center justify-between gap-2">
+                <div className="mb-2.5 p-2.5 rounded-xl bg-rose-950/40 border border-rose-800 text-rose-300 text-xs flex items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5 min-w-0">
                     <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400" />
                     <span className="truncate">{cameraError}</span>
@@ -1367,10 +1683,12 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                 </div>
               )}
 
-              {/* Camera Viewfinder with Real Video Stream & Scanning Laser */}
+              {/* MAXIMIZED RESPONSIVE CAMERA VIEWFINDER (Mobile Tall Viewport with Edge-to-Edge Scan) */}
               {isScanningCamera ? (
-                <div className={`relative aspect-4/3 bg-black rounded-xl overflow-hidden border-2 shadow-inner transition-colors duration-200 ${
-                  scanSuccessFlash ? 'border-emerald-400 ring-4 ring-emerald-400/60' : 'border-emerald-600'
+                <div className={`relative h-[50vh] sm:h-[55vh] min-h-[320px] max-h-[560px] w-full bg-black rounded-2xl overflow-hidden border-2 shadow-2xl transition-all duration-200 ${
+                  scanSuccessFlash 
+                    ? 'border-emerald-400 ring-4 ring-emerald-400/60 shadow-[0_0_30px_rgba(16,185,129,0.6)]' 
+                    : 'border-emerald-500/80'
                 }`}>
                   <video 
                     ref={videoRef} 
@@ -1383,68 +1701,152 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                   {/* Hidden offscreen canvas for frame extraction */}
                   <canvas ref={canvasRef} className="hidden" />
 
-                  {/* Animated Laser Sweep Line */}
-                  <div className="absolute inset-x-0 h-0.5 bg-emerald-400 shadow-[0_0_12px_#34d399] animate-[bounce_2s_infinite]" />
+                  {/* Animated High-Visibility Laser Sweep Line */}
+                  <div className="absolute inset-x-0 h-1 bg-gradient-to-r from-transparent via-emerald-400 to-transparent shadow-[0_0_16px_#34d399] animate-[bounce_2s_infinite] pointer-events-none z-10" />
                   
-                  {/* Torch active overlay pill */}
-                  {isTorchOn && (
-                    <div className="absolute top-2 right-2 px-2 py-0.5 rounded-full bg-amber-400/90 text-slate-950 font-black text-[9px] flex items-center gap-1 shadow-md z-10">
-                      <Flashlight className="w-2.5 h-2.5 fill-slate-950" />
-                      <span>TORCHE ACTIVE</span>
+                  {/* Top Bar Floating Status Pill inside Viewfinder */}
+                  <div className="absolute top-2.5 inset-x-2.5 flex items-center justify-between pointer-events-none z-20 gap-1.5 flex-wrap">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-black flex items-center gap-1 shadow-md border ${
+                        autoApprove 
+                          ? 'bg-emerald-950/85 text-emerald-300 border-emerald-500/60' 
+                          : 'bg-slate-900/85 text-slate-300 border-slate-700'
+                      }`}>
+                        <Zap className={`w-3 h-3 ${autoApprove ? 'fill-emerald-400 text-emerald-300 animate-pulse' : 'text-slate-400'}`} />
+                        <span>{autoApprove ? 'AUTO-VALIDATION' : 'MANUEL'}</span>
+                      </span>
+
+                      {/* Real-time SW & Network Indicator */}
+                      <button
+                        type="button"
+                        onClick={() => setIsOfflineModalOpen(true)}
+                        className={`pointer-events-auto px-2 py-0.5 rounded-full text-[10px] font-black flex items-center gap-1 shadow-md border cursor-pointer transition-all ${
+                          effectiveIsOnline
+                            ? 'bg-emerald-950/90 text-emerald-300 border-emerald-500/70 hover:bg-emerald-900'
+                            : 'bg-amber-950/90 text-amber-300 border-amber-600 animate-pulse hover:bg-amber-900'
+                        }`}
+                        title="Connectivité Réseau & Service Worker en temps réel"
+                      >
+                        {effectiveIsOnline ? (
+                          <>
+                            <span className="relative flex h-1.5 w-1.5">
+                              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                              <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500"></span>
+                            </span>
+                            <Wifi className="w-3 h-3 text-emerald-400" />
+                            <span>CLOUD EN LIGNE {swNetwork.latencyMs ? `(${swNetwork.latencyMs}ms)` : ''}</span>
+                          </>
+                        ) : (
+                          <>
+                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+                            <WifiOff className="w-3 h-3 text-amber-400" />
+                            <span>HORS-LIGNE · RELAIS SW</span>
+                          </>
+                        )}
+                      </button>
                     </div>
-                  )}
+
+                    {isTorchOn && (
+                      <div className="px-2 py-0.5 rounded-full bg-amber-400 text-slate-950 font-black text-[9px] flex items-center gap-1 shadow-md">
+                        <Flashlight className="w-2.5 h-2.5 fill-slate-950" />
+                        <span>TORCHE ON</span>
+                      </div>
+                    )}
+                  </div>
 
                   {/* Detection Success Flash Overlay */}
                   {scanSuccessFlash && (
-                    <div className="absolute inset-0 bg-emerald-500/20 flex items-center justify-center z-20 animate-in fade-in duration-75">
-                      <div className="px-3 py-1.5 rounded-xl bg-emerald-600 text-white font-black text-xs flex items-center gap-1.5 shadow-2xl">
-                        <CheckCircle2 className="w-4 h-4" />
-                        <span>QR CODE DÉTECTÉ !</span>
+                    <div className="absolute inset-0 bg-emerald-500/30 backdrop-blur-xs flex items-center justify-center z-30 animate-in fade-in duration-75">
+                      <div className="px-4 py-2.5 rounded-2xl bg-emerald-600 text-white font-black text-sm flex items-center gap-2 shadow-2xl border-2 border-emerald-300">
+                        <CheckCircle2 className="w-5 h-5 text-amber-300" />
+                        <span>QR DÉTECTÉ · APPROBATION IMMÉDIATE !</span>
                       </div>
                     </div>
                   )}
 
-                  {/* High-visibility Targeting Reticle */}
-                  <div className="absolute inset-6 pointer-events-none flex flex-col items-center justify-between z-10">
+                  {/* Corner Reticle Brackets (Target Framing) */}
+                  <div className="absolute inset-4 sm:inset-6 pointer-events-none flex flex-col items-center justify-between z-10">
                     <div className="w-full flex justify-between">
-                      <div className="w-6 h-6 border-t-3 border-l-3 border-emerald-400 rounded-tl-sm shadow-xs" />
-                      <div className="w-6 h-6 border-t-3 border-r-3 border-emerald-400 rounded-tr-sm shadow-xs" />
+                      <div className="w-7 h-7 border-t-3 border-l-3 border-emerald-400 rounded-tl-sm shadow-[0_0_8px_#34d399]" />
+                      <div className="w-7 h-7 border-t-3 border-r-3 border-emerald-400 rounded-tr-sm shadow-[0_0_8px_#34d399]" />
                     </div>
 
-                    <div className="text-center px-2 py-1 rounded bg-black/70 backdrop-blur-xs text-emerald-300 font-mono text-[10px] tracking-wide border border-emerald-500/30">
-                      Pointez vers le QR Code AFRIWAY (Scan Live Automatique)
+                    {/* Center Targeting Box Guide */}
+                    <div className="w-48 sm:w-56 h-48 sm:h-56 border border-emerald-500/30 rounded-2xl flex items-center justify-center">
+                      <div className="w-3 h-3 rounded-full bg-emerald-400/40 animate-ping" />
                     </div>
 
                     <div className="w-full flex justify-between">
-                      <div className="w-6 h-6 border-b-3 border-l-3 border-emerald-400 rounded-bl-sm shadow-xs" />
-                      <div className="w-6 h-6 border-b-3 border-r-3 border-emerald-400 rounded-br-sm shadow-xs" />
+                      <div className="w-7 h-7 border-b-3 border-l-3 border-emerald-400 rounded-bl-sm shadow-[0_0_8px_#34d399]" />
+                      <div className="w-7 h-7 border-b-3 border-r-3 border-emerald-400 rounded-br-sm shadow-[0_0_8px_#34d399]" />
                     </div>
                   </div>
+
+                  {/* VISUAL VERIFICATION PROGRESS BAR HUD (Overlaid at bottom of Viewfinder) */}
+                  {(isVerifying || verificationProgress !== null) ? (
+                    <div className="absolute inset-x-3 bottom-3 z-30 p-3 rounded-2xl bg-slate-950/95 backdrop-blur-md border-2 border-emerald-500 shadow-2xl animate-in fade-in slide-in-from-bottom-2 duration-150">
+                      <div className="flex items-center justify-between text-xs font-black mb-1.5">
+                        <span className="flex items-center gap-1.5 text-emerald-300 truncate">
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-400 shrink-0" />
+                          <span className="truncate">{verificationStage || 'Vérification en cours...'}</span>
+                        </span>
+                        <span className="font-mono text-emerald-400 text-xs px-2 py-0.5 rounded-full bg-emerald-950 border border-emerald-700 shrink-0">
+                          {verificationProgress}%
+                        </span>
+                      </div>
+                      <div className="w-full bg-slate-900 rounded-full h-3 overflow-hidden border border-emerald-500/40 p-0.5">
+                        <div 
+                          className="bg-gradient-to-r from-emerald-500 via-teal-400 to-emerald-300 h-full rounded-full transition-all duration-150 ease-out shadow-[0_0_12px_#34d399]"
+                          style={{ width: `${verificationProgress || 0}%` }}
+                        />
+                      </div>
+                      <div className="mt-1 flex items-center justify-between text-[10px] text-slate-400 font-mono">
+                        <span className="flex items-center gap-1">
+                          <ShieldCheck className="w-3 h-3 text-emerald-400" />
+                          <span>SHA-256 HMAC</span>
+                        </span>
+                        <span className="text-emerald-400 font-semibold">
+                          {autoApprove ? 'Validation Instantanée ⚡' : 'Contrôle Manuel'}
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    /* Default Idle Viewfinder Guide Pill */
+                    <div className="absolute inset-x-3 bottom-3 pointer-events-none flex justify-center z-10">
+                      <span className="px-3.5 py-1.5 rounded-full bg-black/75 backdrop-blur-md text-emerald-300 text-xs font-medium border border-emerald-500/40 flex items-center gap-2 shadow-xl">
+                        <Scan className="w-3.5 h-3.5 animate-pulse text-emerald-400" />
+                        <span>Pointez vers le QR Code AFRIWAY</span>
+                      </span>
+                    </div>
+                  )}
                 </div>
               ) : (
-                /* Inactive Viewfinder Prompt */
-                <div className={`aspect-16/9 rounded-xl border border-dashed flex flex-col items-center justify-center p-4 text-center transition-colors relative overflow-hidden ${
+                /* Inactive Viewfinder Prompt with Large Touch Area */
+                <div className={`h-[38vh] sm:h-[44vh] min-h-[260px] rounded-2xl border-2 border-dashed flex flex-col items-center justify-center p-4 text-center transition-colors relative overflow-hidden ${
                   effectiveTheme === 'dark'
                     ? 'bg-slate-900/80 border-slate-700 text-slate-400'
                     : 'bg-slate-50 border-slate-300 text-slate-500'
                 }`}>
-                  <div className="w-12 h-12 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-500 flex items-center justify-center mb-2">
-                    <QrCode className="w-6 h-6" />
+                  <div className="w-14 h-14 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-500 flex items-center justify-center mb-2 shadow-inner">
+                    <QrCode className="w-8 h-8" />
                   </div>
-                  <p className="text-xs font-semibold max-w-[260px] text-slate-300">
-                    Caméra éteinte. Cliquez sur <strong className="text-emerald-400">"Activer Caméra"</strong> pour scanner en continu ou importez une photo.
+                  <h4 className="text-sm font-black text-slate-200">
+                    Scanner de Quai Prêt
+                  </h4>
+                  <p className="text-xs font-medium max-w-[280px] text-slate-400 mt-1">
+                    Activez la caméra pour approuver automatiquement les billets dès la détection QR.
                   </p>
-                  <div className="mt-2.5 flex items-center gap-2">
+                  <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
                     <button
                       onClick={toggleCamera}
-                      className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg text-xs flex items-center gap-1.5 cursor-pointer shadow-sm"
+                      className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-black rounded-xl text-xs flex items-center gap-2 cursor-pointer shadow-lg active:scale-98 transition-all"
                     >
-                      <Camera className="w-3.5 h-3.5" />
-                      <span>Démarrer Scan Live</span>
+                      <Camera className="w-4 h-4" />
+                      <span>Activer Caméra Plein Écran</span>
                     </button>
                     <button
                       onClick={() => fileInputRef.current?.click()}
-                      className={`px-3 py-1 font-bold rounded-lg text-xs flex items-center gap-1.5 cursor-pointer border ${
+                      className={`px-3 py-2.5 font-bold rounded-xl text-xs flex items-center gap-1.5 cursor-pointer border transition-colors ${
                         effectiveTheme === 'dark'
                           ? 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white'
                           : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-100'
@@ -1457,16 +1859,63 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                 </div>
               )}
 
+              {/* Instant Auto-Approve Control Banner */}
+              <div className={`mt-3 p-2.5 rounded-xl border flex items-center justify-between transition-colors ${
+                autoApprove
+                  ? effectiveTheme === 'dark'
+                    ? 'bg-emerald-950/40 border-emerald-800 text-emerald-200'
+                    : 'bg-emerald-50/80 border-emerald-300 text-emerald-900'
+                  : effectiveTheme === 'dark'
+                  ? 'bg-slate-800 border-slate-700 text-slate-300'
+                  : 'bg-slate-100 border-slate-300 text-slate-700'
+              }`}>
+                <div className="flex items-center gap-2 min-w-0">
+                  <div className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${
+                    autoApprove ? 'bg-emerald-600 text-white shadow-xs' : 'bg-slate-700 text-slate-400'
+                  }`}>
+                    <Zap className="w-4 h-4 fill-current" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-xs font-black truncate flex items-center gap-1.5">
+                      <span>Approbation Directe au Scan</span>
+                      <span className={`text-[9px] font-black px-1.5 py-0.2 rounded-full uppercase ${
+                        autoApprove 
+                          ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40' 
+                          : 'bg-slate-700 text-slate-400'
+                      }`}>
+                        {autoApprove ? 'ACTIF ⚡' : 'MANUEL'}
+                      </span>
+                    </div>
+                    <p className="text-[10px] opacity-75 truncate">
+                      {autoApprove 
+                        ? 'Le scan approuve et embarque immédiatement le voyageur' 
+                        : 'Demande de vérification manuelle avant embarquement'}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={handleToggleAutoApprove}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-black cursor-pointer transition-all shadow-xs shrink-0 ${
+                    autoApprove
+                      ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                      : 'bg-slate-700 hover:bg-slate-600 text-slate-200'
+                  }`}
+                  title="Activer ou désactiver l'approbation directe automatique"
+                >
+                  {autoApprove ? 'Désactiver' : 'Activer ⚡'}
+                </button>
+              </div>
+
               {/* Quick Demo Scan Buttons for Instant Testing on Phone */}
-              <div className={`mt-3 pt-3 border-t ${effectiveTheme === 'dark' ? 'border-slate-700/60' : 'border-slate-200'}`}>
+              <div className={`mt-2.5 pt-2.5 border-t ${effectiveTheme === 'dark' ? 'border-slate-700/60' : 'border-slate-200'}`}>
                 <div className="flex items-center justify-between mb-1.5">
                   <span className={`text-[10px] uppercase font-bold tracking-wider ${
                     effectiveTheme === 'dark' ? 'text-slate-400' : 'text-slate-500'
                   }`}>
-                    Billets de test rapides (Simulation 1-Clic) :
+                    Simulations 1-Clic :
                   </span>
                   <span className="text-[10px] text-emerald-400 font-semibold font-mono">
-                    {recentBookings.length} en base
+                    {recentBookings.length} billets disponibles
                   </span>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
@@ -1505,7 +1954,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                     }`}
                     title="Simuler un faux billet ou PNR introuvable"
                   >
-                    Test Billet Faux ❌
+                    Faux Billet ❌
                   </button>
 
                   {/* Tampered signature test button */}
@@ -1530,13 +1979,13 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                     }`}
                     title="Simuler un QR code dont la signature cryptographique a été falsifiée"
                   >
-                    Test Fraude Signature ⚠️
+                    Fraude Hash ⚠️
                   </button>
                 </div>
               </div>
             </div>
 
-            {/* Manual PNR Saisie Input */}
+            {/* Manual PNR Search Bar */}
             <form
               onSubmit={(e) => {
                 e.preventDefault();
@@ -1553,7 +2002,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                   value={pnrInput}
                   onChange={(e) => setPnrInput(e.target.value.toUpperCase())}
                   placeholder="Saisir PNR (ex: AFW-84920)"
-                  className={`w-full pl-9 pr-3 py-2.5 rounded-xl border font-mono text-sm tracking-wider uppercase focus:outline-none focus:ring-2 focus:ring-emerald-500 transition-colors ${
+                  className={`w-full pl-9 pr-3 py-2 rounded-xl border font-mono text-sm tracking-wider uppercase focus:outline-none focus:ring-2 focus:ring-emerald-500 transition-colors ${
                     effectiveTheme === 'dark'
                       ? 'bg-slate-800 text-white border-slate-700 placeholder-slate-500'
                       : 'bg-white text-slate-900 border-slate-300 placeholder-slate-400 shadow-xs'
@@ -1562,15 +2011,92 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
               </div>
               <button
                 type="submit"
-                className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer shadow-md shrink-0"
+                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer shadow-md shrink-0"
               >
                 <span>Vérifier</span>
               </button>
             </form>
 
-            {/* 4. VERIFICATION RESULT BANNER (GIANT FEEDBACK) */}
+            {/* DIRECT AUTO-APPROVED PASSENGER CARD (GIANT GREEN INSTANT FEEDBACK) */}
+            {scanStatus === 'auto_approved' && activeBooking && (
+              <div className="bg-emerald-950 border-3 border-emerald-400 rounded-2xl p-4 sm:p-5 shadow-2xl animate-in zoom-in-95 duration-150 relative overflow-hidden">
+                {/* Visual Glow Header */}
+                <div className="flex items-center justify-between pb-3 border-b border-emerald-800/80">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <div className="w-11 h-11 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center shrink-0 shadow-lg font-black">
+                      <CheckCircle2 className="w-7 h-7 text-slate-950 stroke-[3]" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[10px] font-black uppercase tracking-wider text-emerald-300 bg-emerald-900/90 px-2 py-0.5 rounded-full border border-emerald-500/60">
+                          ⚡ EMBARQUEMENT VALIDÉ DIRECTEMENT
+                        </span>
+                      </div>
+                      <h4 className="text-xl sm:text-2xl font-black text-white mt-0.5 truncate">
+                        {activeBooking.passengers[0]?.firstName} {activeBooking.passengers[0]?.lastName}
+                      </h4>
+                    </div>
+                  </div>
+
+                  {/* Seat Badge */}
+                  <div className="text-right shrink-0 bg-slate-900/90 px-3 py-1.5 rounded-xl border border-emerald-500/60 shadow-md">
+                    <span className="text-[9px] uppercase tracking-wider text-slate-400 font-bold block">Siège</span>
+                    <span className="text-lg sm:text-xl font-black text-amber-300 font-mono">
+                      {activeBooking.passengers.map((p: any) => p.seatNumber).join(', ')}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Trip details grid */}
+                <div className="mt-3 grid grid-cols-2 gap-2 text-xs bg-slate-900/90 p-3 rounded-xl border border-emerald-800/80 font-medium">
+                  <div>
+                    <span className="text-[10px] text-slate-400 block font-normal">Compagnie</span>
+                    <span className="font-bold text-white">{activeBooking.trip.companyName}</span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-slate-400 block font-normal">Départ</span>
+                    <span className="font-bold text-emerald-300 font-mono">
+                      {activeBooking.trip.departureTime} ({activeBooking.trip.departureDate})
+                    </span>
+                  </div>
+                  <div className="col-span-2">
+                    <span className="text-[10px] text-slate-400 block font-normal">Trajet</span>
+                    <span className="font-bold text-slate-200">
+                      {activeBooking.trip.originCity} ➔ {activeBooking.trip.destinationCity}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Cryptographic Security Seal */}
+                <div className="mt-2.5 flex items-center justify-between text-[10px] font-mono text-emerald-300 bg-slate-900/90 px-3 py-2 rounded-xl border border-emerald-800">
+                  <div className="flex items-center gap-1.5 truncate">
+                    <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span className="truncate">Signature SHA-256 HMAC Certifiée Conforme</span>
+                  </div>
+                  <span className="text-slate-400 shrink-0">PNR: {activeBooking.pnr}</span>
+                </div>
+
+                {/* Fast Action to Scan Next Passenger */}
+                <div className="mt-3">
+                  <button
+                    onClick={handleScanNextPassenger}
+                    className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 active:scale-98 text-slate-950 font-black text-xs sm:text-sm rounded-xl flex items-center justify-center gap-2 shadow-xl cursor-pointer transition-all uppercase tracking-wide"
+                  >
+                    <UserCheck className="w-4 h-4 text-slate-950" />
+                    <span>Voyageur Suivant ➔</span>
+                    {nextScanCountdown !== null && (
+                      <span className="px-2 py-0.5 bg-slate-950 text-emerald-300 rounded-full text-xs font-mono font-bold">
+                        {nextScanCountdown}s
+                      </span>
+                    )}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* MANUAL MODE VERIFIED BANNER (Only when Auto-Approve is toggled OFF by Controller) */}
             {scanStatus === 'valid' && activeBooking && (
-              <div className="bg-emerald-950 border-2 border-emerald-500 rounded-2xl p-5 shadow-2xl animate-in zoom-in-95 duration-150">
+              <div className="bg-emerald-950 border-2 border-emerald-500 rounded-2xl p-4 sm:p-5 shadow-2xl animate-in zoom-in-95 duration-150">
                 <div className="flex items-center gap-3">
                   <div className="w-12 h-12 rounded-full bg-emerald-600 text-white flex items-center justify-center shrink-0 shadow-lg">
                     <CheckCircle2 className="w-7 h-7" />
@@ -1586,7 +2112,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                 </div>
 
                 {/* Travel details summary */}
-                <div className="mt-4 grid grid-cols-2 gap-2 text-xs bg-slate-900/80 p-3 rounded-xl border border-emerald-800/60 font-medium">
+                <div className="mt-3 grid grid-cols-2 gap-2 text-xs bg-slate-900/80 p-3 rounded-xl border border-emerald-800/60 font-medium">
                   <div>
                     <span className="text-[10px] text-slate-400 block">Compagnie</span>
                     <span className="font-bold text-white">{activeBooking.trip.companyName}</span>
@@ -2152,6 +2678,92 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
               </button>
             </div>
 
+            {/* Real-time Service Worker & Network Diagnostic Card */}
+            <div className={`mt-3.5 p-3.5 rounded-xl border transition-colors ${
+              effectiveIsOnline
+                ? 'bg-emerald-950/40 border-emerald-800/80 text-emerald-100'
+                : 'bg-amber-950/40 border-amber-800/80 text-amber-100'
+            }`}>
+              <div className="flex items-center justify-between pb-2.5 border-b border-slate-700/60">
+                <div className="flex items-center gap-2">
+                  <div className={`w-8 h-8 rounded-lg flex items-center justify-center font-black shadow-xs ${
+                    effectiveIsOnline ? 'bg-emerald-600 text-white' : 'bg-amber-600 text-white'
+                  }`}>
+                    {effectiveIsOnline ? <Wifi className="w-4 h-4" /> : <WifiOff className="w-4 h-4" />}
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs font-black tracking-tight">
+                        {effectiveIsOnline ? 'Connectivité Réseau : EN LIGNE' : 'Connectivité Réseau : HORS-LIGNE'}
+                      </span>
+                      <span className={`w-2 h-2 rounded-full ${effectiveIsOnline ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'}`} />
+                    </div>
+                    <p className="text-[11px] opacity-80">
+                      {effectiveIsOnline 
+                        ? 'Synchronisation cloud Firebase active en temps réel' 
+                        : 'Relais automatique par le Service Worker PWA (Cache local actif)'}
+                    </p>
+                  </div>
+                </div>
+
+                <button
+                  onClick={handleManualProbe}
+                  disabled={isProbingLive}
+                  className="px-2.5 py-1 text-xs font-bold rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-slate-600 flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50 transition-colors"
+                  title="Effectuer un test de ping réseau en direct"
+                >
+                  <Activity className={`w-3.5 h-3.5 ${isProbingLive ? 'animate-spin text-amber-300' : 'text-emerald-400'}`} />
+                  <span>{isProbingLive ? 'Test...' : 'Ping Live'}</span>
+                </button>
+              </div>
+
+              {/* Service Worker Diagnostics Grid */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mt-2.5 text-[11px]">
+                <div className="bg-slate-900/70 p-2 rounded-lg border border-slate-800">
+                  <span className="text-[10px] text-slate-400 block font-medium">Service Worker</span>
+                  <span className="font-bold flex items-center gap-1 text-emerald-400">
+                    <Cpu className="w-3 h-3" />
+                    <span>{swNetwork.swRegistered ? 'Actif & Enregistré' : 'Initialisé'}</span>
+                  </span>
+                </div>
+
+                <div className="bg-slate-900/70 p-2 rounded-lg border border-slate-800">
+                  <span className="text-[10px] text-slate-400 block font-medium">Contrôle des Requêtes</span>
+                  <span className="font-bold text-slate-200">
+                    {swNetwork.swControlled ? 'Interception SW ✅' : 'Prêt (PWA Active)'}
+                  </span>
+                </div>
+
+                <div className="bg-slate-900/70 p-2 rounded-lg border border-slate-800">
+                  <span className="text-[10px] text-slate-400 block font-medium">Latence / Ping</span>
+                  <span className="font-bold font-mono text-amber-300">
+                    {swNetwork.latencyMs !== null ? `${swNetwork.latencyMs} ms` : 'Hors-Ligne (0ms local)'}
+                  </span>
+                </div>
+
+                <div className="bg-slate-900/70 p-2 rounded-lg border border-slate-800">
+                  <span className="text-[10px] text-slate-400 block font-medium">Cache PWA Workbox</span>
+                  <span className="font-bold text-emerald-400">
+                    {swNetwork.cacheStorageReady ? 'Precache Prêt ✅' : 'Initialisé'}
+                  </span>
+                </div>
+
+                <div className="bg-slate-900/70 p-2 rounded-lg border border-slate-800">
+                  <span className="text-[10px] text-slate-400 block font-medium">Type Connexion</span>
+                  <span className="font-bold uppercase text-slate-200">
+                    {swNetwork.connectionType || 'Cellulaire/Wifi'}
+                  </span>
+                </div>
+
+                <div className="bg-slate-900/70 p-2 rounded-lg border border-slate-800">
+                  <span className="text-[10px] text-slate-400 block font-medium">Dernier contrôle</span>
+                  <span className="font-bold text-slate-300 font-mono">
+                    {swNetwork.lastChecked || 'À l\'instant'}
+                  </span>
+                </div>
+              </div>
+            </div>
+
             {/* Force Offline Toggle Switch */}
             <div className={`mt-4 p-3.5 rounded-xl border flex items-center justify-between gap-3 transition-colors ${
               forcedOffline
@@ -2299,6 +2911,72 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
               <p>• <strong>Zéro Latence :</strong> Même sans signal 4G/WiFi, chaque billet est authentifié instantanément grâce au cache local.</p>
               <p>• <strong>Anti-Fraude Sécurisé :</strong> Tout billet scanné est marqué invalide pour les scans suivants sur ce terminal, empêchant la fraude même hors-ligne.</p>
               <p>• <strong>Synchronisation Automatique :</strong> Dès le retour de la connexion, les billets embarqués sont poussés vers Firebase sans action requise.</p>
+            </div>
+
+            {/* Loud Terminal Sensory Feedback (Haptics & High-Frequency Acoustic Chime) */}
+            <div className={`mt-4 p-3 rounded-xl border ${
+              effectiveTheme === 'dark'
+                ? 'bg-slate-800/80 border-slate-700'
+                : 'bg-amber-50/60 border-amber-200'
+            }`}>
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <div className="flex items-center gap-1.5">
+                  <Smartphone className="w-4 h-4 text-amber-500 animate-pulse" />
+                  <span className="text-xs font-black uppercase tracking-wider">
+                    Retour Sensoriel Quai & Gare Bruyante
+                  </span>
+                </div>
+                <span className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                  987Hz - 1318Hz + Double Buzz
+                </span>
+              </div>
+              <p className={`text-[11px] mb-2.5 ${
+                effectiveTheme === 'dark' ? 'text-slate-300' : 'text-slate-600'
+              }`}>
+                Dans le vacarme des moteurs diesel, avertisseurs et foules d'embarquement, le retour visuel ne suffit pas. Le terminal émet un carillon perçant à double harmonique et une vibration haptique franche [120ms, 40ms, 180ms] ressentie même en marchant.
+              </p>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleTestAudioAndHaptics}
+                  className="px-3 py-2 bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 text-slate-950 text-xs font-black rounded-lg flex items-center gap-1.5 cursor-pointer shadow-md transition-all active:scale-95"
+                >
+                  <Volume2 className="w-3.5 h-3.5" />
+                  <Smartphone className="w-3.5 h-3.5" />
+                  <span>Tester Bip & Vibreur (Simulation Gare)</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleToggleHaptics}
+                  className={`px-2.5 py-1.5 text-xs font-bold rounded-lg border flex items-center gap-1.5 transition-colors cursor-pointer ${
+                    hapticsEnabled
+                      ? 'bg-amber-500/20 border-amber-500/50 text-amber-400'
+                      : effectiveTheme === 'dark'
+                      ? 'bg-slate-700 border-slate-600 text-slate-400'
+                      : 'bg-slate-100 border-slate-300 text-slate-600'
+                  }`}
+                >
+                  <Smartphone className="w-3 h-3" />
+                  <span>Vibration : {hapticsEnabled ? 'ACTIVE' : 'DÉSACTIVÉE'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setSoundEnabled(!soundEnabled)}
+                  className={`px-2.5 py-1.5 text-xs font-bold rounded-lg border flex items-center gap-1.5 transition-colors cursor-pointer ${
+                    soundEnabled
+                      ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400'
+                      : effectiveTheme === 'dark'
+                      ? 'bg-slate-700 border-slate-600 text-slate-400'
+                      : 'bg-slate-100 border-slate-300 text-slate-600'
+                  }`}
+                >
+                  <Volume2 className="w-3 h-3" />
+                  <span>Son : {soundEnabled ? 'ACTIF' : 'MUET'}</span>
+                </button>
+              </div>
             </div>
 
             {/* Modal Action Buttons */}

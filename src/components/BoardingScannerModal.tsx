@@ -13,6 +13,7 @@ import {
   Clock, 
   MapPin, 
   Volume2,
+  VolumeX,
   Smartphone,
   ShieldCheck,
   ShieldAlert
@@ -38,6 +39,110 @@ export const BoardingScannerModal: React.FC<BoardingScannerModalProps> = ({
   const [isScanningCamera, setIsScanningCamera] = useState<boolean>(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [recentBookings, setRecentBookings] = useState<Booking[]>([]);
+
+  // Sound and Haptic feedback states
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
+    try {
+      const stored = localStorage.getItem('afriway_controller_sound_v1');
+      return stored !== null ? stored === 'true' : true;
+    } catch {
+      return true;
+    }
+  });
+  const [hapticsEnabled, setHapticsEnabled] = useState<boolean>(() => {
+    try {
+      const stored = localStorage.getItem('afriway_controller_haptics_v1');
+      return stored !== null ? stored === 'true' : true;
+    } catch {
+      return true;
+    }
+  });
+  const audioCtxRef = useRef<AudioContext | null>(null);
+
+  // High-penetration haptic vibration feedback for loud terminals
+  const triggerHapticFeedback = (type: 'success' | 'warning' | 'error') => {
+    if (!hapticsEnabled) return;
+    if (typeof navigator === 'undefined' || !navigator.vibrate) return;
+    try {
+      if (type === 'success') {
+        // High-impact sharp double pulse: 120ms sharp buzz, 40ms pause, 180ms confirming buzz
+        navigator.vibrate([120, 40, 180]);
+      } else if (type === 'warning') {
+        navigator.vibrate([140, 60, 140, 60, 140]);
+      } else {
+        navigator.vibrate([350]);
+      }
+    } catch (e) {
+      console.warn('Haptic vibration failed:', e);
+    }
+  };
+
+  // High-penetration acoustic chime generator tuned for noisy bus terminals
+  const playAudioBeep = (type: 'success' | 'warning' | 'error') => {
+    if (!soundEnabled) return;
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new AudioCtx();
+      }
+      const ctx = audioCtxRef.current;
+      if (ctx.state === 'suspended') {
+        ctx.resume();
+      }
+
+      const now = ctx.currentTime;
+      if (type === 'success') {
+        // Dual harmonic bell chime (B5 987.77 Hz -> E6 1318.51 Hz + B6/E7 overtone)
+        const osc1 = ctx.createOscillator();
+        const osc2 = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        osc1.type = 'sine';
+        osc1.frequency.setValueAtTime(987.77, now);
+        osc1.frequency.setValueAtTime(1318.51, now + 0.07);
+
+        osc2.type = 'triangle';
+        osc2.frequency.setValueAtTime(1975.53, now);
+        osc2.frequency.setValueAtTime(2637.02, now + 0.07);
+
+        gain.gain.setValueAtTime(0.35, now);
+        gain.gain.exponentialRampToValueAtTime(0.005, now + 0.25);
+
+        osc1.connect(gain);
+        osc2.connect(gain);
+        gain.connect(ctx.destination);
+
+        osc1.start(now);
+        osc2.start(now);
+        osc1.stop(now + 0.25);
+        osc2.stop(now + 0.25);
+      } else if (type === 'warning') {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(320, now);
+        osc.frequency.setValueAtTime(240, now + 0.1);
+        gain.gain.setValueAtTime(0.3, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.35);
+        osc.start(now);
+        osc.stop(now + 0.35);
+      } else {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(160, now);
+        gain.gain.setValueAtTime(0.35, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.45);
+        osc.start(now);
+        osc.stop(now + 0.45);
+      }
+    } catch {}
+  };
 
   useEffect(() => {
     // Initial local read
@@ -65,6 +170,8 @@ export const BoardingScannerModal: React.FC<BoardingScannerModalProps> = ({
     const rateCheck = checkRateLimit('modal_scanner');
     if (!rateCheck.allowed) {
       alert(`Trop de tentatives rapprochées. Veuillez patienter ${rateCheck.retryAfterSeconds}s.`);
+      playAudioBeep('error');
+      triggerHapticFeedback('error');
       return;
     }
 
@@ -77,6 +184,8 @@ export const BoardingScannerModal: React.FC<BoardingScannerModalProps> = ({
       setActiveBooking(null);
       setScanStatus('not_found');
       setSecurityMessage('Aucun billet enregistré pour ce code PNR.');
+      playAudioBeep('error');
+      triggerHapticFeedback('error');
       return;
     }
 
@@ -88,13 +197,19 @@ export const BoardingScannerModal: React.FC<BoardingScannerModalProps> = ({
 
     if (!integrity.isValid) {
       setScanStatus('fraud_tampered');
+      playAudioBeep('error');
+      triggerHapticFeedback('error');
       return;
     }
 
     if (booking.boardingStatus === 'boarded') {
       setScanStatus('already_boarded');
+      playAudioBeep('warning');
+      triggerHapticFeedback('warning');
     } else {
       setScanStatus('valid');
+      playAudioBeep('success');
+      triggerHapticFeedback('success');
     }
   };
 
@@ -104,6 +219,8 @@ export const BoardingScannerModal: React.FC<BoardingScannerModalProps> = ({
     updateBoardingStatusInCloud(activeBooking.id, 'boarded', agentName).catch((err) =>
       console.warn('Cloud boarding update fallback:', err)
     );
+    playAudioBeep('success');
+    triggerHapticFeedback('success');
     if (updated) {
       setActiveBooking(updated);
       setScanStatus('already_boarded');
@@ -277,6 +394,52 @@ export const BoardingScannerModal: React.FC<BoardingScannerModalProps> = ({
                     </div>
                   </button>
                 ))}
+              </div>
+            </div>
+
+            {/* Loud Terminal Sensory Feedback Pill Controls */}
+            <div className="pt-2 border-t border-slate-100 flex items-center justify-between gap-2 text-xs">
+              <span className="text-[11px] font-semibold text-slate-500">Retour Sensoriel :</span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const nextVal = !soundEnabled;
+                    setSoundEnabled(nextVal);
+                    try { localStorage.setItem('afriway_controller_sound_v1', String(nextVal)); } catch {}
+                    if (nextVal) playAudioBeep('success');
+                  }}
+                  className={`px-2 py-1 rounded-md text-[11px] font-bold border flex items-center gap-1 cursor-pointer transition-colors ${
+                    soundEnabled
+                      ? 'bg-emerald-50 border-emerald-300 text-emerald-700'
+                      : 'bg-slate-50 border-slate-200 text-slate-400'
+                  }`}
+                  title={soundEnabled ? 'Bip sonore actif' : 'Bip sonore désactivé'}
+                >
+                  {soundEnabled ? <Volume2 className="w-3 h-3" /> : <VolumeX className="w-3 h-3" />}
+                  <span>{soundEnabled ? 'Bip 1318Hz' : 'Muet'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    const nextVal = !hapticsEnabled;
+                    setHapticsEnabled(nextVal);
+                    try { localStorage.setItem('afriway_controller_haptics_v1', String(nextVal)); } catch {}
+                    if (nextVal && typeof navigator !== 'undefined' && navigator.vibrate) {
+                      navigator.vibrate([120, 40, 180]);
+                    }
+                  }}
+                  className={`px-2 py-1 rounded-md text-[11px] font-bold border flex items-center gap-1 cursor-pointer transition-colors ${
+                    hapticsEnabled
+                      ? 'bg-amber-50 border-amber-300 text-amber-700'
+                      : 'bg-slate-50 border-slate-200 text-slate-400'
+                  }`}
+                  title={hapticsEnabled ? 'Vibreur haptique actif' : 'Vibreur désactivé'}
+                >
+                  <Smartphone className="w-3 h-3" />
+                  <span>{hapticsEnabled ? 'Vibreur Quai' : 'Vibreur Off'}</span>
+                </button>
               </div>
             </div>
           </div>
