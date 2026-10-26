@@ -16,8 +16,10 @@ import {
   Calendar, 
   Ticket,
   CreditCard,
-  ShieldCheck
+  ShieldCheck,
+  MessageCircle
 } from 'lucide-react';
+import { shareTicketOnWhatsApp } from '../utils/landscapeTicketGenerator';
 
 interface CounterSalesViewProps {
   trips: Trip[];
@@ -386,12 +388,13 @@ export const CounterSalesView: React.FC<CounterSalesViewProps> = ({
                   </button>
                   <button
                     onClick={() => {
-                      const text = `🚌 *BILLET GUICHET AFRIWAY*\nPNR : ${issuedBooking.pnr}\nTrajet : ${issuedBooking.trip.originCity} ➔ ${issuedBooking.trip.destinationCity}\nDépart : ${issuedBooking.trip.departureDate} à ${issuedBooking.trip.departureTime}\nVoyageur : ${issuedBooking.passengers[0].firstName} ${issuedBooking.passengers[0].lastName}\nSiège : ${issuedBooking.passengers[0].seatNumber}\nLien : ${window.location.href}`;
-                      window.open(`https://api.whatsapp.com/send?text=${encodeURIComponent(text)}`, '_blank');
+                      shareTicketOnWhatsApp(issuedBooking, currency);
                     }}
-                    className="py-1.5 px-3 bg-[#25D366] hover:bg-[#20ba59] text-white rounded-lg text-xs font-semibold cursor-pointer flex items-center justify-center gap-1.5"
+                    className="py-1.5 px-3 bg-[#25D366] hover:bg-[#20ba59] text-white rounded-lg text-xs font-black cursor-pointer flex items-center justify-center gap-1.5 shadow-xs"
+                    title="Envoyer le billet format paysage 10×5 cm par WhatsApp au voyageur"
                   >
-                    <span>WhatsApp</span>
+                    <MessageCircle className="w-3.5 h-3.5" />
+                    <span>WhatsApp (10×5 cm)</span>
                   </button>
                 </div>
               </div>

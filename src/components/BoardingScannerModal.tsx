@@ -456,46 +456,63 @@ export const BoardingScannerModal: React.FC<BoardingScannerModalProps> = ({
               </p>
             </div>
           ) : scanStatus === 'not_found' ? (
-            <div className="bg-red-50 rounded-2xl border border-red-200 p-8 text-center space-y-3">
-              <XCircle className="w-12 h-12 text-red-600 mx-auto" />
-              <h3 className="text-lg font-bold text-red-900">Billet Introuvable ou Invalide</h3>
-              <p className="text-xs text-red-700 max-w-md mx-auto">
-                Aucun billet correspondant au code PNR <strong>{pnrInput}</strong> n'a été trouvé dans le système officiel. Veuillez vérifier auprès du chef de gare.
+            <div className="bg-gradient-to-b from-red-900 to-red-950 border-4 border-red-500 rounded-2xl p-6 sm:p-8 text-center space-y-3 text-white shadow-xl animate-in zoom-in-95">
+              <div className="w-16 h-16 rounded-full bg-red-600 text-white flex items-center justify-center mx-auto shadow-lg animate-pulse">
+                <XCircle className="w-10 h-10" />
+              </div>
+              <span className="inline-block px-3 py-0.5 rounded-full text-xs font-black uppercase tracking-wider bg-red-600 text-white">
+                ⛔ ACCÈS REFUSÉ
+              </span>
+              <h3 className="text-2xl sm:text-3xl font-black text-red-100 uppercase tracking-tight">
+                BILLET INVALIDE
+              </h3>
+              <p className="text-xs sm:text-sm text-red-200 max-w-md mx-auto">
+                Aucun billet correspondant au code PNR <strong>{pnrInput}</strong> n'a été trouvé dans le système officiel.
               </p>
+              <div className="p-3 bg-slate-950/80 rounded-xl text-xs text-amber-300 font-semibold border border-red-800">
+                ⚠️ Veuillez orienter le voyageur vers le guichet de gare.
+              </div>
             </div>
           ) : scanStatus === 'fraud_tampered' ? (
-            <div className="bg-red-950 rounded-2xl border-2 border-red-600 p-8 text-center space-y-3 text-white animate-in zoom-in-95">
-              <ShieldAlert className="w-14 h-14 text-red-500 mx-auto" />
-              <span className="text-[10px] font-bold uppercase tracking-wider text-red-200 bg-red-900 px-2 py-0.5 rounded border border-red-700">
-                CONTRÔLE CYBER-SÉCURITÉ ÉCHOUÉ
+            <div className="bg-gradient-to-b from-red-900 to-red-950 border-4 border-red-500 rounded-2xl p-6 sm:p-8 text-center space-y-3 text-white shadow-xl animate-in zoom-in-95">
+              <div className="w-16 h-16 rounded-full bg-red-600 text-white flex items-center justify-center mx-auto shadow-lg animate-pulse">
+                <ShieldAlert className="w-10 h-10" />
+              </div>
+              <span className="inline-block px-3 py-0.5 rounded-full text-xs font-black uppercase tracking-wider bg-red-600 text-white">
+                ⛔ FALSIFICATION DÉTECTÉE
               </span>
-              <h3 className="text-xl font-black text-white">ALERTE FRAUDE : SIGNATURE FALSIFIÉE !</h3>
-              <p className="text-xs text-red-200 max-w-md mx-auto">
+              <h3 className="text-2xl sm:text-3xl font-black text-red-100 uppercase tracking-tight">
+                BILLET INVALIDE
+              </h3>
+              <p className="text-xs sm:text-sm text-red-200 max-w-md mx-auto">
                 {securityMessage || 'La signature cryptographique HMAC de ce billet ne correspond pas. Le billet a été contrefait ou altéré.'}
               </p>
-              <div className="p-3 bg-slate-900 rounded-xl text-[11px] text-amber-300 font-mono border border-red-800">
+              <div className="p-3 bg-slate-950/80 rounded-xl text-xs text-amber-300 font-semibold border border-red-800">
                 Accès refusé. Veuillez orienter le voyageur vers la sécurité de quai ou le bureau des litiges.
               </div>
             </div>
           ) : activeBooking ? (
-            <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs space-y-0">
+            <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xl space-y-0">
               {/* Result Status Banner */}
               <div className={`p-5 flex items-center justify-between ${
                 scanStatus === 'already_boarded'
-                  ? 'bg-amber-500 text-white'
-                  : 'bg-emerald-700 text-white'
+                  ? 'bg-red-600 text-white'
+                  : 'bg-emerald-600 text-white'
               }`}>
                 <div className="flex items-center gap-3">
                   {scanStatus === 'already_boarded' ? (
-                    <AlertTriangle className="w-8 h-8 shrink-0" />
+                    <XCircle className="w-9 h-9 shrink-0 stroke-[2.5]" />
                   ) : (
-                    <CheckCircle2 className="w-8 h-8 shrink-0" />
+                    <CheckCircle2 className="w-9 h-9 shrink-0 stroke-[2.5]" />
                   )}
                   <div>
-                    <h3 className="text-lg font-black tracking-tight">
+                    <span className="text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full bg-black/25 block w-fit mb-0.5">
+                      {scanStatus === 'already_boarded' ? '⛔ ACCÈS REFUSÉ' : '● EMBARQUEMENT APPROUVÉ'}
+                    </span>
+                    <h3 className="text-xl sm:text-2xl font-black tracking-tight uppercase">
                       {scanStatus === 'already_boarded'
-                        ? 'BILLET DÉJÀ EMBARQUÉ !'
-                        : 'BILLET AUTHENTIQUE & VALIDE'}
+                        ? 'BILLET INVALIDE (DÉJÀ EMBARQUÉ)'
+                        : 'BILLET VALIDE'}
                     </h3>
                     <p className="text-xs opacity-90">
                       {scanStatus === 'already_boarded'

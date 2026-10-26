@@ -172,12 +172,14 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
 }) => {
   const [pnrInput, setPnrInput] = useState<string>('');
   const [activeBooking, setActiveBooking] = useState<Booking | null>(null);
-  const [scanStatus, setScanStatus] = useState<'idle' | 'valid' | 'auto_approved' | 'already_boarded' | 'not_found' | 'fraud_tampered'>('idle');
+  const [scanStatus, setScanStatus] = useState<'idle' | 'valid' | 'invalid' | 'auto_approved' | 'already_boarded' | 'not_found' | 'fraud_tampered'>('idle');
+  const [invalidReason, setInvalidReason] = useState<string>('');
   const [securityDetails, setSecurityDetails] = useState<string>('');
   const [isScanningCamera, setIsScanningCamera] = useState<boolean>(false);
   const [cameraFacingMode, setCameraFacingMode] = useState<'environment' | 'user'>('environment');
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [scanSuccessFlash, setScanSuccessFlash] = useState<boolean>(false);
+  const [scanErrorFlash, setScanErrorFlash] = useState<boolean>(false);
   const [isAnalyzingImage, setIsAnalyzingImage] = useState<boolean>(false);
   const [isProfileModalOpen, setIsProfileModalOpen] = useState<boolean>(false);
   const [isInstallModalOpen, setIsInstallModalOpen] = useState<boolean>(false);
@@ -189,6 +191,15 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
       if (stored !== null) return stored === 'true';
     } catch {}
     return true; // Default ON: instant direct approval without manual verification button
+  });
+
+  // Inspection screen persistence mode ('hold' for thorough physical ID & seat check, or 'auto_10s')
+  const [inspectionMode, setInspectionMode] = useState<'hold' | 'auto_10s'>(() => {
+    try {
+      const stored = localStorage.getItem('afriway_controller_inspect_mode_v1');
+      if (stored === 'hold' || stored === 'auto_10s') return stored;
+    } catch {}
+    return 'hold'; // Default HOLD: calm physical ID and seat verification without screen vanishing
   });
 
   // Visual Verification Progress Bar states
@@ -591,6 +602,22 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     setTimeout(() => setSyncNotice(null), 3000);
   };
 
+  // Toggle Inspection Persistence Mode ('hold' without auto-wipe vs 'auto_10s')
+  const handleToggleInspectionMode = () => {
+    const nextVal = inspectionMode === 'hold' ? 'auto_10s' : 'hold';
+    setInspectionMode(nextVal);
+    try {
+      localStorage.setItem('afriway_controller_inspect_mode_v1', nextVal);
+    } catch {}
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    setNextScanCountdown(null);
+    setSyncNotice(nextVal === 'hold' ? "🪪 Mode Maintien d'Écran : vérification CNI & siège sans limite de temps" : "⏱️ Mode Auto 10s activé");
+    setTimeout(() => setSyncNotice(null), 3000);
+  };
+
   // Immediate Reset to scan next passenger without waiting for timer
   const handleScanNextPassenger = () => {
     if (countdownIntervalRef.current) {
@@ -605,6 +632,7 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     setScanStatus('idle');
     setActiveBooking(null);
     setAutoApprovedBooking(null);
+    setInvalidReason('');
     setPnrInput('');
     setIsVerifying(false);
     setVerificationProgress(null);
@@ -694,17 +722,19 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
       setTimeout(() => {
         setIsVerifying(false);
         setVerificationProgress(null);
-      }, 500);
+      }, 400);
 
       setActiveBooking(null);
       setAutoApprovedBooking(null);
-      setScanStatus('not_found');
-      setSecurityDetails('Aucune correspondance en base de données.');
+      setScanStatus('invalid');
+      setInvalidReason('Billet introuvable en base de données ou faux code PNR.');
+      setScanErrorFlash(true);
+      setTimeout(() => setScanErrorFlash(false), 900);
       playAudioBeep('error');
       triggerHapticFeedback('error');
       recordScanToHistory({
         pnr: cleanPnr,
-        passengerName: 'Billet Introuvable / Erroné',
+        passengerName: 'Billet Introuvable / Invalide',
         tripSummary: 'Gare / Quai',
         seatNumber: '-',
         status: 'invalid',
@@ -712,6 +742,30 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
         companyName: 'Inconnue',
         syncMode: isOnline ? 'cloud' : 'offline_cache',
       });
+
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+        countdownIntervalRef.current = null;
+      }
+
+      if (inspectionMode === 'auto_10s') {
+        let seconds = 10;
+        setNextScanCountdown(seconds);
+        countdownIntervalRef.current = setInterval(() => {
+          seconds -= 1;
+          if (seconds <= 0) {
+            clearInterval(countdownIntervalRef.current);
+            countdownIntervalRef.current = null;
+            setNextScanCountdown(null);
+            setScanStatus('idle');
+            setInvalidReason('');
+          } else {
+            setNextScanCountdown(seconds);
+          }
+        }, 1000);
+      } else {
+        setNextScanCountdown(null);
+      }
       return;
     }
 
@@ -731,9 +785,12 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
       setTimeout(() => {
         setIsVerifying(false);
         setVerificationProgress(null);
-      }, 600);
+      }, 400);
 
-      setScanStatus('fraud_tampered');
+      setScanStatus('invalid');
+      setInvalidReason('Billet falsifié ! La signature numérique cryptographique du QR code a été altérée.');
+      setScanErrorFlash(true);
+      setTimeout(() => setScanErrorFlash(false), 900);
       playAudioBeep('error');
       triggerHapticFeedback('error');
       recordScanToHistory({
@@ -746,6 +803,29 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
         companyName: booking.trip.companyName,
         syncMode: isOnline ? 'cloud' : 'offline_cache',
       });
+
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+        countdownIntervalRef.current = null;
+      }
+      if (inspectionMode === 'auto_10s') {
+        let seconds = 10;
+        setNextScanCountdown(seconds);
+        countdownIntervalRef.current = setInterval(() => {
+          seconds -= 1;
+          if (seconds <= 0) {
+            clearInterval(countdownIntervalRef.current);
+            countdownIntervalRef.current = null;
+            setNextScanCountdown(null);
+            setScanStatus('idle');
+            setInvalidReason('');
+          } else {
+            setNextScanCountdown(seconds);
+          }
+        }, 1000);
+      } else {
+        setNextScanCountdown(null);
+      }
       return;
     }
 
@@ -755,9 +835,13 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
       setTimeout(() => {
         setIsVerifying(false);
         setVerificationProgress(null);
-      }, 600);
+      }, 400);
 
-      setScanStatus('already_boarded');
+      setScanStatus('invalid');
+      const boardedTime = booking.boardedAt ? new Date(booking.boardedAt).toLocaleTimeString('fr-FR') : '';
+      setInvalidReason(`Billet déjà utilisé et validé pour l'embarquement${boardedTime ? ` à ${boardedTime}` : ''}. Réutilisation interdite.`);
+      setScanErrorFlash(true);
+      setTimeout(() => setScanErrorFlash(false), 900);
       playAudioBeep('warning');
       triggerHapticFeedback('warning');
       recordScanToHistory({
@@ -770,36 +854,41 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
         companyName: booking.trip.companyName,
         syncMode: isOnline ? 'cloud' : 'offline_cache',
       });
+
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+        countdownIntervalRef.current = null;
+      }
+      if (inspectionMode === 'auto_10s') {
+        let seconds = 10;
+        setNextScanCountdown(seconds);
+        countdownIntervalRef.current = setInterval(() => {
+          seconds -= 1;
+          if (seconds <= 0) {
+            clearInterval(countdownIntervalRef.current);
+            countdownIntervalRef.current = null;
+            setNextScanCountdown(null);
+            setScanStatus('idle');
+            setInvalidReason('');
+          } else {
+            setNextScanCountdown(seconds);
+          }
+        }, 1000);
+      } else {
+        setNextScanCountdown(null);
+      }
       return;
     }
 
-    // Ticket is 100% valid!
+    // Ticket is 100% valid! Directly approve and board without requiring manual check
     setVerificationProgress(100);
-    setVerificationStage(autoApprove ? '⚡ Billet Authentifié : Embarquement Automatique...' : '✅ Billet Authentifié et Conforme');
+    setVerificationStage('⚡ Billet Authentifié : Embarquement Validé');
     setTimeout(() => {
       setIsVerifying(false);
       setVerificationProgress(null);
-    }, 500);
+    }, 400);
 
-    // If AUTO-APPROVE is active (default), execute boarding directly!
-    if (autoApprove) {
-      executeBoarding(booking, true);
-    } else {
-      // Manual approval mode: display verified ticket and wait for controller button
-      setScanStatus('valid');
-      playAudioBeep('success');
-      triggerHapticFeedback('success');
-      recordScanToHistory({
-        pnr: booking.pnr,
-        passengerName: `${booking.passengers[0]?.firstName} ${booking.passengers[0]?.lastName}`,
-        tripSummary: `${booking.trip.originCity} ➔ ${booking.trip.destinationCity}`,
-        seatNumber: booking.passengers.map((p: any) => p.seatNumber).join(', '),
-        status: 'valid',
-        agentName: currentUser.displayName,
-        companyName: booking.trip.companyName,
-        syncMode: isOnline ? 'cloud' : 'offline_cache',
-      });
-    }
+    executeBoarding(booking, true);
   };
 
   // Execute Boarding (used by both instant auto-approval and manual confirmation)
@@ -843,16 +932,23 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
     const finalBooking = updatedBooking || { ...bookingToBoard, boardingStatus: 'boarded' as const };
     setActiveBooking(finalBooking);
     setAutoApprovedBooking(finalBooking);
-    setScanStatus(isAuto ? 'auto_approved' : 'already_boarded');
+    setScanStatus('valid');
+    setInvalidReason('');
+    setScanSuccessFlash(true);
+    setTimeout(() => setScanSuccessFlash(false), 900);
     setRecentBookings(getCachedBookingsForController());
     setCacheMeta(getControllerCacheMetadata());
     setPendingQueue(getPendingOfflineQueue());
 
-    if (isAuto) {
-      // Auto-clear countdown for seamless queue flow (3 seconds)
-      let secondsRemaining = 3;
+    // Screen persistence management: in 'hold' mode, keep ticket on screen indefinitely for thorough ID verification
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+
+    if (inspectionMode === 'auto_10s') {
+      let secondsRemaining = 10;
       setNextScanCountdown(secondsRemaining);
-      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
       countdownIntervalRef.current = setInterval(() => {
         secondsRemaining -= 1;
         if (secondsRemaining <= 0) {
@@ -866,6 +962,8 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
           setNextScanCountdown(secondsRemaining);
         }
       }, 1000);
+    } else {
+      setNextScanCountdown(null);
     }
   };
 
@@ -1643,6 +1741,24 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                     <Smartphone className={`w-3.5 h-3.5 ${hapticsEnabled ? 'animate-pulse' : ''}`} />
                   </button>
 
+                  {/* Inspection Mode (Hold / Maintien CNI vs Auto 10s) */}
+                  <button
+                    onClick={handleToggleInspectionMode}
+                    className={`p-1.5 sm:px-2.5 sm:py-1 text-xs font-bold rounded-lg border transition-all cursor-pointer flex items-center gap-1 shrink-0 ${
+                      inspectionMode === 'hold'
+                        ? effectiveTheme === 'dark'
+                          ? 'bg-emerald-950/80 border-emerald-500/70 text-emerald-300 shadow-sm'
+                          : 'bg-emerald-50 border-emerald-400 text-emerald-800 shadow-sm'
+                        : effectiveTheme === 'dark'
+                        ? 'bg-slate-800 border-slate-700 text-slate-400'
+                        : 'bg-slate-100 border-slate-300 text-slate-500'
+                    }`}
+                    title={inspectionMode === 'hold' ? "Mode Maintien d'Écran Actif : la fiche reste affichée sans minuteur pour vérifier la CNI et le siège physique" : "Mode Auto 10s Actif"}
+                  >
+                    <IdCard className="w-3.5 h-3.5 text-emerald-400" />
+                    <span className="hidden sm:inline">{inspectionMode === 'hold' ? 'Maintien CNI' : 'Auto 10s'}</span>
+                  </button>
+
                   {/* Camera ON / OFF Button */}
                   <button
                     onClick={toggleCamera}
@@ -1685,9 +1801,11 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
 
               {/* MAXIMIZED RESPONSIVE CAMERA VIEWFINDER (Mobile Tall Viewport with Edge-to-Edge Scan) */}
               {isScanningCamera ? (
-                <div className={`relative h-[50vh] sm:h-[55vh] min-h-[320px] max-h-[560px] w-full bg-black rounded-2xl overflow-hidden border-2 shadow-2xl transition-all duration-200 ${
-                  scanSuccessFlash 
-                    ? 'border-emerald-400 ring-4 ring-emerald-400/60 shadow-[0_0_30px_rgba(16,185,129,0.6)]' 
+                <div className={`relative h-[50vh] sm:h-[55vh] min-h-[320px] max-h-[560px] w-full bg-black rounded-2xl overflow-hidden border-3 shadow-2xl transition-all duration-200 ${
+                  scanErrorFlash
+                    ? 'border-red-500 ring-8 ring-red-500/70 shadow-[0_0_40px_rgba(239,68,68,0.8)]'
+                    : scanSuccessFlash 
+                    ? 'border-emerald-400 ring-8 ring-emerald-400/70 shadow-[0_0_40px_rgba(16,185,129,0.8)]' 
                     : 'border-emerald-500/80'
                 }`}>
                   <video 
@@ -1697,6 +1815,25 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                     muted 
                     autoPlay
                   />
+
+                  {/* Instant Screen Flash Overlay on Scan */}
+                  {scanSuccessFlash && (
+                    <div className="absolute inset-0 bg-emerald-500/30 pointer-events-none z-30 animate-pulse flex items-center justify-center">
+                      <span className="px-4 py-2 rounded-2xl bg-emerald-600 text-white font-black text-base shadow-2xl border-2 border-white flex items-center gap-2">
+                        <CheckCircle2 className="w-5 h-5" />
+                        <span>BILLET VALIDE</span>
+                      </span>
+                    </div>
+                  )}
+
+                  {scanErrorFlash && (
+                    <div className="absolute inset-0 bg-red-600/40 pointer-events-none z-30 animate-pulse flex items-center justify-center">
+                      <span className="px-4 py-2 rounded-2xl bg-red-600 text-white font-black text-base shadow-2xl border-2 border-white flex items-center gap-2">
+                        <XCircle className="w-5 h-5" />
+                        <span>BILLET INVALIDE</span>
+                      </span>
+                    </div>
+                  )}
 
                   {/* Hidden offscreen canvas for frame extraction */}
                   <canvas ref={canvasRef} className="hidden" />
@@ -1859,127 +1996,79 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
                 </div>
               )}
 
-              {/* Instant Auto-Approve Control Banner */}
-              <div className={`mt-3 p-2.5 rounded-xl border flex items-center justify-between transition-colors ${
-                autoApprove
-                  ? effectiveTheme === 'dark'
-                    ? 'bg-emerald-950/40 border-emerald-800 text-emerald-200'
-                    : 'bg-emerald-50/80 border-emerald-300 text-emerald-900'
-                  : effectiveTheme === 'dark'
-                  ? 'bg-slate-800 border-slate-700 text-slate-300'
-                  : 'bg-slate-100 border-slate-300 text-slate-700'
-              }`}>
-                <div className="flex items-center gap-2 min-w-0">
-                  <div className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${
-                    autoApprove ? 'bg-emerald-600 text-white shadow-xs' : 'bg-slate-700 text-slate-400'
-                  }`}>
-                    <Zap className="w-4 h-4 fill-current" />
-                  </div>
-                  <div className="min-w-0">
-                    <div className="text-xs font-black truncate flex items-center gap-1.5">
-                      <span>Approbation Directe au Scan</span>
-                      <span className={`text-[9px] font-black px-1.5 py-0.2 rounded-full uppercase ${
-                        autoApprove 
-                          ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40' 
-                          : 'bg-slate-700 text-slate-400'
-                      }`}>
-                        {autoApprove ? 'ACTIF ⚡' : 'MANUEL'}
-                      </span>
-                    </div>
-                    <p className="text-[10px] opacity-75 truncate">
-                      {autoApprove 
-                        ? 'Le scan approuve et embarque immédiatement le voyageur' 
-                        : 'Demande de vérification manuelle avant embarquement'}
-                    </p>
-                  </div>
-                </div>
-                <button
-                  onClick={handleToggleAutoApprove}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-black cursor-pointer transition-all shadow-xs shrink-0 ${
-                    autoApprove
-                      ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
-                      : 'bg-slate-700 hover:bg-slate-600 text-slate-200'
-                  }`}
-                  title="Activer ou désactiver l'approbation directe automatique"
-                >
-                  {autoApprove ? 'Désactiver' : 'Activer ⚡'}
-                </button>
-              </div>
-
-              {/* Quick Demo Scan Buttons for Instant Testing on Phone */}
-              <div className={`mt-2.5 pt-2.5 border-t ${effectiveTheme === 'dark' ? 'border-slate-700/60' : 'border-slate-200'}`}>
+              {/* Quick 1-Touch Simulation Testing (Clear Tests for Station Control) */}
+              <div className={`mt-3 pt-2.5 border-t ${effectiveTheme === 'dark' ? 'border-slate-700/60' : 'border-slate-200'}`}>
                 <div className="flex items-center justify-between mb-1.5">
                   <span className={`text-[10px] uppercase font-bold tracking-wider ${
                     effectiveTheme === 'dark' ? 'text-slate-400' : 'text-slate-500'
                   }`}>
-                    Simulations 1-Clic :
+                    Simulations Rapides Quai :
                   </span>
                   <span className="text-[10px] text-emerald-400 font-semibold font-mono">
-                    {recentBookings.length} billets disponibles
+                    Scan Direct Auto ⚡
                   </span>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
-                  {recentBookings.slice(0, 3).map((b) => (
+                  {/* Valid Ticket Test */}
+                  {recentBookings.find((b) => b.boardingStatus !== 'boarded') ? (
                     <button
-                      key={b.id}
                       onClick={() => {
+                        const validBooking = recentBookings.find((b) => b.boardingStatus !== 'boarded')!;
+                        setPnrInput(validBooking.pnr);
+                        handleInspect(validBooking.pnr);
+                      }}
+                      className="px-2.5 py-1 text-[11px] font-mono font-bold rounded-lg border border-emerald-500/50 bg-emerald-950/60 hover:bg-emerald-900/80 text-emerald-300 transition-colors cursor-pointer flex items-center gap-1 shadow-sm"
+                      title="Tester un scan de billet valide (Sortira en VERT)"
+                    >
+                      <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                      <span>Billet Valide ({recentBookings.find((b) => b.boardingStatus !== 'boarded')!.pnr})</span>
+                    </button>
+                  ) : recentBookings.length > 0 ? (
+                    <button
+                      onClick={() => {
+                        const b = recentBookings[0];
+                        updateBoardingInControllerCache(b.pnr, 'not_boarded', currentUser.displayName);
                         setPnrInput(b.pnr);
                         handleInspect(b.pnr);
                       }}
-                      className={`px-2.5 py-1 text-[11px] font-mono font-bold rounded border transition-colors cursor-pointer flex items-center gap-1 ${
-                        effectiveTheme === 'dark'
-                          ? 'bg-slate-700 hover:bg-slate-600 text-slate-200 border-slate-600'
-                          : 'bg-slate-100 hover:bg-slate-200 text-slate-800 border-slate-300'
-                      }`}
-                      title={`Passager : ${b.passengers[0]?.firstName} ${b.passengers[0]?.lastName} - Statut : ${b.boardingStatus}`}
+                      className="px-2.5 py-1 text-[11px] font-mono font-bold rounded-lg border border-emerald-500/50 bg-emerald-950/60 hover:bg-emerald-900/80 text-emerald-300 transition-colors cursor-pointer flex items-center gap-1 shadow-sm"
                     >
-                      <span className={b.boardingStatus === 'boarded' ? 'text-amber-400' : 'text-emerald-400'}>
-                        ●
-                      </span>
-                      <span>{b.pnr}</span>
-                      <span className="text-[10px] text-slate-400">({b.passengers[0]?.firstName})</span>
+                      <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                      <span>Billet Valide ({recentBookings[0].pnr})</span>
                     </button>
-                  ))}
+                  ) : null}
 
-                  {/* Invalid ticket test button */}
-                  <button
-                    onClick={() => {
-                      setPnrInput('AFW-INVALIDE-99');
-                      handleInspect('AFW-INVALIDE-99');
-                    }}
-                    className={`px-2 py-1 text-[10px] font-mono font-bold rounded border transition-colors cursor-pointer text-rose-400 ${
-                      effectiveTheme === 'dark'
-                        ? 'bg-rose-950/40 border-rose-800 hover:bg-rose-900/60'
-                        : 'bg-rose-50 border-rose-300 hover:bg-rose-100 text-rose-700'
-                    }`}
-                    title="Simuler un faux billet ou PNR introuvable"
-                  >
-                    Faux Billet ❌
-                  </button>
-
-                  {/* Tampered signature test button */}
+                  {/* Already Boarded Ticket Test (Outputs INVALID in RED) */}
                   <button
                     onClick={() => {
                       if (recentBookings.length > 0) {
                         const b = recentBookings[0];
-                        const tampered = { ...b, verificationHash: 'AFW-SEC-FORGED-TAMPERED-HASH-0000' };
-                        setActiveBooking(tampered);
-                        setScanStatus('fraud_tampered');
-                        setSecurityDetails('ALERTE : Données altérées ! La signature SHA-256 HMAC a été falsifiée.');
-                        playAudioBeep('error');
+                        updateBoardingInControllerCache(b.pnr, 'boarded', 'Agent Contrôle Quai');
+                        setPnrInput(b.pnr);
+                        handleInspect(b.pnr);
                       } else {
-                        setPnrInput('AFW-FRAUDE-99');
-                        handleInspect('AFW-FRAUDE-99');
+                        setPnrInput('AFW-DEJA-UTILISE');
+                        handleInspect('AFW-DEJA-UTILISE');
                       }
                     }}
-                    className={`px-2 py-1 text-[10px] font-mono font-bold rounded border transition-colors cursor-pointer text-amber-400 ${
-                      effectiveTheme === 'dark'
-                        ? 'bg-amber-950/40 border-amber-800 hover:bg-amber-900/60'
-                        : 'bg-amber-50 border-amber-300 hover:bg-amber-100 text-amber-800'
-                    }`}
-                    title="Simuler un QR code dont la signature cryptographique a été falsifiée"
+                    className="px-2.5 py-1 text-[11px] font-mono font-bold rounded-lg border border-red-500/50 bg-red-950/60 hover:bg-red-900/80 text-red-300 transition-colors cursor-pointer flex items-center gap-1 shadow-sm"
+                    title="Tester un billet déjà utilisé (Sortira en ROUGE)"
                   >
-                    Fraude Hash ⚠️
+                    <XCircle className="w-3 h-3 text-red-400" />
+                    <span>Déjà Utilisé (Rouge)</span>
+                  </button>
+
+                  {/* Fake / Non-Existent Ticket Test (Outputs INVALID in RED) */}
+                  <button
+                    onClick={() => {
+                      setPnrInput('AFW-FAUX-999');
+                      handleInspect('AFW-FAUX-999');
+                    }}
+                    className="px-2.5 py-1 text-[11px] font-mono font-bold rounded-lg border border-red-500/50 bg-red-950/60 hover:bg-red-900/80 text-red-300 transition-colors cursor-pointer flex items-center gap-1 shadow-sm"
+                    title="Tester un faux billet introuvable (Sortira en ROUGE)"
+                  >
+                    <XCircle className="w-3 h-3 text-red-400" />
+                    <span>Faux Billet (Rouge)</span>
                   </button>
                 </div>
               </div>
@@ -2011,262 +2100,291 @@ export const MobileControllerTerminal: React.FC<MobileControllerTerminalProps> =
               </div>
               <button
                 type="submit"
-                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer shadow-md shrink-0"
+                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer shadow-md shrink-0 uppercase"
               >
-                <span>Vérifier</span>
+                <span>Scanner</span>
               </button>
             </form>
 
-            {/* DIRECT AUTO-APPROVED PASSENGER CARD (GIANT GREEN INSTANT FEEDBACK) */}
-            {scanStatus === 'auto_approved' && activeBooking && (
-              <div className="bg-emerald-950 border-3 border-emerald-400 rounded-2xl p-4 sm:p-5 shadow-2xl animate-in zoom-in-95 duration-150 relative overflow-hidden">
-                {/* Visual Glow Header */}
-                <div className="flex items-center justify-between pb-3 border-b border-emerald-800/80">
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <div className="w-11 h-11 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center shrink-0 shadow-lg font-black">
-                      <CheckCircle2 className="w-7 h-7 text-slate-950 stroke-[3]" />
+            {/* ======================================================== */}
+            {/* 1. BILLET VALIDE EN VERT (VÉRIFICATION D'IDENTITÉ & SIÈGE) */}
+            {/* ======================================================== */}
+            {(scanStatus === 'valid' || scanStatus === 'auto_approved') && activeBooking && (() => {
+              const selectedTripObj = trips.find(t => t.id === selectedTripFilter);
+              const isWrongBus = selectedTripObj && activeBooking.trip.id && selectedTripObj.id !== activeBooking.trip.id;
+
+              return (
+                <div className="bg-gradient-to-b from-emerald-900 to-emerald-950 border-4 border-emerald-400 rounded-3xl p-5 sm:p-6 shadow-[0_12px_45px_rgba(16,185,129,0.45)] animate-in zoom-in-95 duration-150 relative overflow-hidden text-white space-y-4">
+                  
+                  {/* Top Status Banner */}
+                  <div className="flex items-center gap-3.5 pb-3.5 border-b border-emerald-700/60">
+                    <div className="w-14 h-14 rounded-2xl bg-emerald-400 text-slate-950 flex items-center justify-center shrink-0 shadow-[0_0_25px_rgba(52,211,153,0.7)] font-black">
+                      <CheckCircle2 className="w-9 h-9 stroke-[3]" />
                     </div>
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-[10px] font-black uppercase tracking-wider text-emerald-300 bg-emerald-900/90 px-2 py-0.5 rounded-full border border-emerald-500/60">
-                          ⚡ EMBARQUEMENT VALIDÉ DIRECTEMENT
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-400 text-slate-950 shadow-sm">
+                          ● ACCÈS AUTORISÉ À BORD
+                        </span>
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider bg-emerald-950 text-emerald-300 border border-emerald-600">
+                          {wasBoardedOffline ? 'RELAIS HORS-LIGNE' : 'CLOUD DIRECT'}
                         </span>
                       </div>
-                      <h4 className="text-xl sm:text-2xl font-black text-white mt-0.5 truncate">
-                        {activeBooking.passengers[0]?.firstName} {activeBooking.passengers[0]?.lastName}
-                      </h4>
+                      <h3 className="text-2xl sm:text-3xl font-black text-white tracking-tight uppercase mt-0.5">
+                        BILLET VALIDE
+                      </h3>
                     </div>
                   </div>
 
-                  {/* Seat Badge */}
-                  <div className="text-right shrink-0 bg-slate-900/90 px-3 py-1.5 rounded-xl border border-emerald-500/60 shadow-md">
-                    <span className="text-[9px] uppercase tracking-wider text-slate-400 font-bold block">Siège</span>
-                    <span className="text-lg sm:text-xl font-black text-amber-300 font-mono">
-                      {activeBooking.passengers.map((p: any) => p.seatNumber).join(', ')}
+                  {/* Wrong Bus Alert if ticket doesn't match the selected bus */}
+                  {isWrongBus && (
+                    <div className="bg-amber-400 text-slate-950 p-3.5 rounded-2xl border-2 border-amber-300 font-bold text-xs space-y-1 shadow-lg">
+                      <div className="flex items-center gap-2 font-black text-xs uppercase tracking-wide">
+                        <AlertTriangle className="w-5 h-5 text-slate-950 shrink-0" />
+                        <span>ATTENTION CONTRÔLEUR : RISQUE D'ERREUR DE CAR !</span>
+                      </div>
+                      <p className="text-[11px] font-semibold text-slate-950">
+                        Filtre actuel sur ce quai : <strong>{selectedTripObj.companyName} ➔ {selectedTripObj.destinationCity} (Car {selectedTripObj.plateNumber})</strong>
+                      </p>
+                      <p className="text-[11px] font-semibold text-slate-950">
+                        Billet présenté : <strong>{activeBooking.trip.companyName} ➔ {activeBooking.trip.destinationCity} (Car {activeBooking.trip.plateNumber})</strong>
+                      </p>
+                      <span className="inline-block mt-1 px-2 py-0.5 bg-slate-950 text-amber-300 rounded text-[9px] uppercase font-black">
+                        Vérifiez que le voyageur se dirige vers le bon véhicule
+                      </span>
+                    </div>
+                  )}
+
+                  {/* SECTION 1: VÉRIFICATION D'IDENTITÉ SUR PIÈCE PHYSIQUE */}
+                  <div className="bg-slate-950/85 p-4 rounded-2xl border-2 border-emerald-500/70 space-y-3">
+                    <div className="flex items-center justify-between border-b border-emerald-800/60 pb-2">
+                      <span className="text-[11px] text-emerald-300 font-black uppercase tracking-wider flex items-center gap-1.5">
+                        <IdCard className="w-4 h-4 text-emerald-400" />
+                        <span>VÉRIFICATION IDENTITÉ SUR PIÈCE PHYSIQUE</span>
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-600 font-mono text-[10px] font-bold uppercase">
+                        {activeBooking.passengers.length > 1 ? `${activeBooking.passengers.length} passagers` : 'Passager Unique'}
+                      </span>
+                    </div>
+
+                    {/* Passenger Items List */}
+                    {activeBooking.passengers.map((passenger, idx) => (
+                      <div key={idx} className={`${idx > 0 ? 'pt-3 border-t border-emerald-900/60' : ''} space-y-2.5`}>
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0 flex-1">
+                            <span className="text-[10px] text-emerald-400 font-bold uppercase tracking-wider block">
+                              {idx === 0 ? 'Nom complet du voyageur' : `Passager N°${idx + 1}`}
+                            </span>
+                            <h4 className="text-xl sm:text-2xl font-black text-white tracking-tight mt-0.5">
+                              {passenger.firstName} {passenger.lastName?.toUpperCase()}
+                            </h4>
+                          </div>
+
+                          {/* Massive Seat Badge next to passenger */}
+                          <div className="bg-gradient-to-br from-amber-400 to-amber-500 text-slate-950 px-3.5 py-1.5 rounded-xl text-center shadow-lg border border-amber-200 shrink-0">
+                            <span className="text-[9px] uppercase font-black block tracking-wider text-slate-900">
+                              SIÈGE
+                            </span>
+                            <span className="text-2xl sm:text-3xl font-black font-mono leading-none">
+                              {passenger.seatNumber}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Physical ID Comparison Box */}
+                        <div className="p-2.5 rounded-xl bg-emerald-950/90 border border-emerald-600/80 text-xs space-y-1.5">
+                          <div className="flex items-center justify-between flex-wrap gap-1.5">
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-bold text-emerald-300 text-xs uppercase">Document :</span>
+                              <span className="px-2 py-0.5 rounded bg-slate-900 text-amber-300 font-black font-mono text-xs border border-amber-400/40">
+                                {passenger.idType || 'CNI'}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1">
+                              <span className="text-[10px] text-emerald-400 font-semibold">N° PIÈCE :</span>
+                              <span className="font-mono text-sm font-black text-white bg-slate-900 px-2.5 py-0.5 rounded border border-emerald-400 tracking-wider">
+                                {passenger.idNumber || 'NON RENSEIGNÉ'}
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center justify-between text-[11px] text-emerald-300/90 pt-1 border-t border-emerald-900/60">
+                            <span>📞 Tél : <strong className="text-white font-mono">{passenger.phone || 'Non renseigné'}</strong></span>
+                            <span>🌍 Nationalité : <strong className="text-white">{passenger.nationality || 'Mali (CEDEAO)'}</strong></span>
+                          </div>
+
+                          <div className="pt-1 text-[10px] text-amber-300 font-bold flex items-center gap-1">
+                            <ShieldCheck className="w-3.5 h-3.5 text-amber-300 shrink-0" />
+                            <span>Contrôleur : Vérifiez la concordance exacte avec la carte physique.</span>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* SECTION 2: VÉHICULE, TRAJET & CLASSE */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <div className="bg-slate-950/80 p-3 rounded-2xl border border-emerald-700/60 space-y-1">
+                      <span className="text-[10px] uppercase font-bold text-emerald-300 flex items-center gap-1">
+                        <Bus className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Car Assigné</span>
+                      </span>
+                      <div className="text-base font-black text-white">
+                        {activeBooking.trip.companyName}
+                      </div>
+                      <div className="text-xs font-mono font-black text-amber-300">
+                        Matricule : Car {activeBooking.trip.plateNumber || 'Non spécifié'}
+                      </div>
+                      <div className="text-[11px] text-slate-300">
+                        {activeBooking.trip.busModel || 'Autocar Grand Tourisme'} · {activeBooking.trip.busClass === 'vip' ? 'VIP Grand Confort' : 'Standard Climatisé'}
+                      </div>
+                    </div>
+
+                    <div className="bg-slate-950/80 p-3 rounded-2xl border border-emerald-700/60 space-y-1">
+                      <span className="text-[10px] uppercase font-bold text-emerald-300 flex items-center gap-1">
+                        <Clock className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Départ & Trajet</span>
+                      </span>
+                      <div className="text-base font-black text-white">
+                        {activeBooking.trip.departureTime} · {activeBooking.trip.departureDate}
+                      </div>
+                      <div className="text-xs font-bold text-emerald-300 truncate">
+                        {activeBooking.trip.originCity} ({activeBooking.trip.originStationName})
+                      </div>
+                      <div className="text-xs font-black text-white flex items-center gap-1">
+                        <span>➔</span>
+                        <span>{activeBooking.trip.destinationCity} ({activeBooking.trip.destinationStationName})</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* SECTION 3: SÉCURITÉ PNR & PAIEMENT */}
+                  <div className="bg-slate-950/60 p-3 rounded-xl border border-emerald-800 text-xs space-y-1.5 font-mono">
+                    <div className="flex items-center justify-between">
+                      <span className="text-emerald-300">PNR : <strong className="text-white font-bold">{activeBooking.pnr}</strong></span>
+                      <span className="text-emerald-400 font-bold flex items-center gap-1">
+                        <ShieldCheck className="w-3.5 h-3.5 text-emerald-300" />
+                        <span>SHA-256 HMAC Conforme</span>
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between text-[11px] text-slate-300 pt-1 border-t border-emerald-900/60">
+                      <span>Paiement : {activeBooking.paymentStatus === 'completed' ? 'Payé 100% ✅' : 'Validé'} ({activeBooking.paymentProvider || 'Mobile Money'})</span>
+                      <span className="text-amber-300 font-bold">{activeBooking.totalAmountXOF?.toLocaleString('fr-FR')} FCFA</span>
+                    </div>
+                  </div>
+
+                  {/* SECTION 4: BOUTON D'ACTION PRINCIPAL (VOYAGEUR SUIVANT) */}
+                  <div className="space-y-1.5 pt-1">
+                    <button
+                      onClick={handleScanNextPassenger}
+                      className="w-full py-4 bg-emerald-400 hover:bg-emerald-300 active:scale-98 text-slate-950 font-black text-base rounded-2xl flex items-center justify-center gap-2 shadow-[0_0_25px_rgba(52,211,153,0.6)] cursor-pointer transition-all uppercase tracking-wide border-2 border-emerald-200"
+                    >
+                      <UserCheck className="w-6 h-6 text-slate-950" />
+                      <span>VOYAGEUR SUIVANT ➔</span>
+                      {nextScanCountdown !== null && (
+                        <span className="px-2.5 py-0.5 bg-slate-950 text-emerald-300 rounded-full text-xs font-mono font-bold">
+                          {nextScanCountdown}s
+                        </span>
+                      )}
+                    </button>
+                    <div className="text-center text-[10px] text-emerald-200/90 font-medium">
+                      {inspectionMode === 'hold'
+                        ? "Mode Maintien Actif : Cette fiche reste affichée sans chrono. Appuyez sur « Voyageur Suivant » ou scannez le prochain QR."
+                        : `Auto-enchaînement actif : passage au voyageur suivant dans ${nextScanCountdown || 10}s.`}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* ======================================================== */}
+            {/* 2. BILLET INVALIDE EN ROUGE (ACCÈS REFUSÉ À BORD)        */}
+            {/* ======================================================== */}
+            {(scanStatus === 'invalid' || scanStatus === 'fraud_tampered' || scanStatus === 'already_boarded' || scanStatus === 'not_found') && (
+              <div className="bg-gradient-to-b from-red-950 to-rose-950 border-4 border-red-500 rounded-3xl p-5 sm:p-6 shadow-[0_12px_45px_rgba(239,68,68,0.55)] animate-in zoom-in-95 duration-150 relative overflow-hidden text-white space-y-4">
+                
+                {/* Header: Massively visible BILLET INVALIDE in RED */}
+                <div className="flex items-center gap-3.5 pb-4 border-b border-red-700/60">
+                  <div className="w-14 h-14 rounded-2xl bg-red-600 text-white flex items-center justify-center shrink-0 shadow-[0_0_25px_rgba(239,68,68,0.8)] animate-pulse">
+                    <XCircle className="w-9 h-9 stroke-[3]" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-red-600 text-white shadow-sm">
+                      ⛔ ACCÈS STRICTEMENT REFUSÉ
                     </span>
+                    <h3 className="text-2xl sm:text-3xl font-black text-white tracking-tight uppercase mt-0.5 text-red-100">
+                      BILLET INVALIDE
+                    </h3>
                   </div>
                 </div>
 
-                {/* Trip details grid */}
-                <div className="mt-3 grid grid-cols-2 gap-2 text-xs bg-slate-900/90 p-3 rounded-xl border border-emerald-800/80 font-medium">
-                  <div>
-                    <span className="text-[10px] text-slate-400 block font-normal">Compagnie</span>
-                    <span className="font-bold text-white">{activeBooking.trip.companyName}</span>
+                {/* Reason Explanation in high-visibility red/amber box */}
+                <div className="bg-slate-950/85 p-4 rounded-2xl border-2 border-red-600 text-sm space-y-3">
+                  <div className="flex items-start gap-2.5 text-rose-300 font-bold">
+                    <ShieldAlert className="w-6 h-6 text-red-400 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="text-xs uppercase tracking-wider text-red-400 font-black block">
+                        Motif du Refus :
+                      </span>
+                      <span className="text-sm sm:text-base text-red-100 font-black leading-snug">
+                        {invalidReason || 'Ce billet n\'est pas autorisé pour l\'embarquement.'}
+                      </span>
+                    </div>
                   </div>
-                  <div>
-                    <span className="text-[10px] text-slate-400 block font-normal">Départ</span>
-                    <span className="font-bold text-emerald-300 font-mono">
-                      {activeBooking.trip.departureTime} ({activeBooking.trip.departureDate})
-                    </span>
-                  </div>
-                  <div className="col-span-2">
-                    <span className="text-[10px] text-slate-400 block font-normal">Trajet</span>
-                    <span className="font-bold text-slate-200">
-                      {activeBooking.trip.originCity} ➔ {activeBooking.trip.destinationCity}
-                    </span>
+
+                  {activeBooking && (
+                    <div className="p-3 bg-red-950/50 rounded-xl border border-red-800/80 text-xs text-slate-300 space-y-1">
+                      <div>Passager sur le dossier : <strong className="text-white font-bold">{activeBooking.passengers[0]?.firstName} {activeBooking.passengers[0]?.lastName}</strong></div>
+                      {activeBooking.passengers[0]?.idNumber && (
+                        <div>Pièce déclarée : <strong className="text-amber-300 font-mono">{activeBooking.passengers[0]?.idType} - {activeBooking.passengers[0]?.idNumber}</strong></div>
+                      )}
+                      <div>Trajet : <strong className="text-white">{activeBooking.trip.originCity} ➔ {activeBooking.trip.destinationCity} ({activeBooking.trip.companyName})</strong></div>
+                      {activeBooking.boardingStatus === 'boarded' && (
+                        <div className="text-amber-400 pt-1 font-bold">
+                          ⚠️ Déjà embarqué le {activeBooking.boardedAt ? new Date(activeBooking.boardedAt).toLocaleTimeString('fr-FR') : ''} par : {activeBooking.boardedByAgent || 'Autre agent'}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="p-3 bg-amber-950/60 rounded-xl text-xs text-amber-200 font-bold border border-amber-600/70 space-y-1">
+                    <div className="flex items-center gap-1.5 text-amber-300 font-black uppercase text-[11px]">
+                      <AlertTriangle className="w-4 h-4 shrink-0" />
+                      <span>Consigne Quai de Sécurité :</span>
+                    </div>
+                    <p className="text-[11px] leading-relaxed">
+                      1. Ne laissez pas monter ce voyageur dans le véhicule.<br />
+                      2. Orientez le voyageur vers le chef de quai ou le guichet litiges de la gare.
+                    </p>
                   </div>
                 </div>
 
-                {/* Cryptographic Security Seal */}
-                <div className="mt-2.5 flex items-center justify-between text-[10px] font-mono text-emerald-300 bg-slate-900/90 px-3 py-2 rounded-xl border border-emerald-800">
-                  <div className="flex items-center gap-1.5 truncate">
-                    <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-                    <span className="truncate">Signature SHA-256 HMAC Certifiée Conforme</span>
-                  </div>
-                  <span className="text-slate-400 shrink-0">PNR: {activeBooking.pnr}</span>
+                {/* PNR Code */}
+                <div className="flex items-center justify-between text-xs bg-slate-950/60 px-3.5 py-2 rounded-xl border border-red-800 text-red-300 font-mono">
+                  <span>Code : {lastScannedPnr || pnrInput || 'Inconnu'}</span>
+                  <span className="text-red-400 font-black">STATUT : REFUSÉ ❌</span>
                 </div>
 
-                {/* Fast Action to Scan Next Passenger */}
-                <div className="mt-3">
+                {/* Next Passenger Button */}
+                <div className="space-y-1.5 pt-1">
                   <button
                     onClick={handleScanNextPassenger}
-                    className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 active:scale-98 text-slate-950 font-black text-xs sm:text-sm rounded-xl flex items-center justify-center gap-2 shadow-xl cursor-pointer transition-all uppercase tracking-wide"
+                    className="w-full py-4 bg-red-600 hover:bg-red-500 active:scale-98 text-white font-black text-base rounded-2xl flex items-center justify-center gap-2 shadow-[0_0_25px_rgba(239,68,68,0.6)] cursor-pointer transition-all uppercase tracking-wide border-2 border-red-400"
                   >
-                    <UserCheck className="w-4 h-4 text-slate-950" />
-                    <span>Voyageur Suivant ➔</span>
+                    <RotateCcw className="w-6 h-6 text-white" />
+                    <span>VOYAGEUR SUIVANT ➔</span>
                     {nextScanCountdown !== null && (
-                      <span className="px-2 py-0.5 bg-slate-950 text-emerald-300 rounded-full text-xs font-mono font-bold">
+                      <span className="px-2.5 py-0.5 bg-black/60 text-red-200 rounded-full text-xs font-mono font-bold">
                         {nextScanCountdown}s
                       </span>
                     )}
                   </button>
-                </div>
-              </div>
-            )}
-
-            {/* MANUAL MODE VERIFIED BANNER (Only when Auto-Approve is toggled OFF by Controller) */}
-            {scanStatus === 'valid' && activeBooking && (
-              <div className="bg-emerald-950 border-2 border-emerald-500 rounded-2xl p-4 sm:p-5 shadow-2xl animate-in zoom-in-95 duration-150">
-                <div className="flex items-center gap-3">
-                  <div className="w-12 h-12 rounded-full bg-emerald-600 text-white flex items-center justify-center shrink-0 shadow-lg">
-                    <CheckCircle2 className="w-7 h-7" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-400 bg-emerald-900/80 px-2 py-0.5 rounded">
-                      Billet Authentifié · Prêt à Monter
-                    </span>
-                    <h4 className="text-xl font-black text-white mt-0.5 truncate">
-                      {activeBooking.passengers[0]?.firstName} {activeBooking.passengers[0]?.lastName}
-                    </h4>
+                  <div className="text-center text-[10px] text-red-200/90 font-medium">
+                    {inspectionMode === 'hold'
+                      ? "Mode Maintien Actif : L'alerte reste affichée. Appuyez sur « Voyageur Suivant » ou scannez le prochain QR."
+                      : `Auto-enchaînement actif : passage au voyageur suivant dans ${nextScanCountdown || 10}s.`}
                   </div>
                 </div>
-
-                {/* Travel details summary */}
-                <div className="mt-3 grid grid-cols-2 gap-2 text-xs bg-slate-900/80 p-3 rounded-xl border border-emerald-800/60 font-medium">
-                  <div>
-                    <span className="text-[10px] text-slate-400 block">Compagnie</span>
-                    <span className="font-bold text-white">{activeBooking.trip.companyName}</span>
-                  </div>
-                  <div>
-                    <span className="text-[10px] text-slate-400 block">Siège(s)</span>
-                    <span className="font-black text-amber-300 font-mono">
-                      Place {activeBooking.passengers.map((p: any) => p.seatNumber).join(', ')}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-[10px] text-slate-400 block">Trajet</span>
-                    <span className="font-bold text-slate-200">
-                      {activeBooking.trip.originCity} ➔ {activeBooking.trip.destinationCity}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-[10px] text-slate-400 block">Départ</span>
-                    <span className="font-bold text-emerald-400 font-mono">
-                      {activeBooking.trip.departureTime} ({activeBooking.trip.departureDate})
-                    </span>
-                  </div>
-                </div>
-
-                {/* Cryptographic Security Seal */}
-                <div className="mt-3 flex items-center gap-1.5 text-[10px] font-mono text-emerald-300 bg-slate-900/90 p-2.5 rounded-xl border border-emerald-800">
-                  <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-                  <span className="truncate">
-                    {securityDetails || 'Signature Cryptographique Certifiée Conforme (SHA-256 HMAC)'}
-                  </span>
-                </div>
-
-                {/* Big Action Button to Validate Boarding */}
-                <button
-                  onClick={handleConfirmBoarding}
-                  className="mt-4 w-full py-3.5 bg-emerald-600 hover:bg-emerald-500 active:scale-98 text-white text-sm font-black rounded-xl flex items-center justify-center gap-2 shadow-xl cursor-pointer transition-all uppercase tracking-wider"
-                >
-                  <UserCheck className="w-5 h-5" />
-                  <span>Valider l'Embarquement</span>
-                </button>
-              </div>
-            )}
-
-            {/* FRAUD / TAMPERED TICKET SECURITY ALERT */}
-            {scanStatus === 'fraud_tampered' && (
-              <div className="bg-red-950 border-4 border-red-600 rounded-2xl p-5 shadow-2xl animate-in zoom-in-95 duration-150 text-white space-y-3">
-                <div className="flex items-center gap-3">
-                  <div className="w-12 h-12 rounded-full bg-red-600 text-white flex items-center justify-center shrink-0 shadow-lg">
-                    <ShieldAlert className="w-7 h-7" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-red-200 bg-red-900 px-2 py-0.5 rounded border border-red-700">
-                      ALERTE CYBER-SÉCURITÉ · FALSIFICATION DÉTECTÉE
-                    </span>
-                    <h4 className="text-xl font-black text-white mt-0.5">
-                      Signature Numérique Non Conforme !
-                    </h4>
-                  </div>
-                </div>
-
-                <div className="bg-slate-950/90 p-3.5 rounded-xl border border-red-800 text-xs text-red-200 space-y-2 font-mono">
-                  <p className="font-bold text-red-400 flex items-center gap-1.5">
-                    <ShieldAlert className="w-4 h-4" />
-                    <span>Ce QR code ou ce billet a été modifié frauduleusement.</span>
-                  </p>
-                  <p className="text-[11px] text-slate-300">
-                    {securityDetails || 'Le hachage cryptographique ne correspond pas aux paramètres officiels du billet.'}
-                  </p>
-                  <div className="pt-2 border-t border-red-900/60 text-amber-300 font-semibold text-[11px]">
-                    Action requise : Refuser l'accès à bord et orienter vers la sécurité de la gare.
-                  </div>
-                </div>
-
-                <button
-                  onClick={() => {
-                    setScanStatus('idle');
-                    setActiveBooking(null);
-                  }}
-                  className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-xl transition-colors cursor-pointer"
-                >
-                  Fermer l'alerte
-                </button>
-              </div>
-            )}
-
-            {scanStatus === 'already_boarded' && activeBooking && (
-              <div className="bg-rose-950/90 border-2 border-rose-500 rounded-2xl p-5 shadow-2xl animate-in zoom-in-95 duration-150">
-                <div className="flex items-center gap-3">
-                  <div className="w-12 h-12 rounded-full bg-rose-600 text-white flex items-center justify-center shrink-0 shadow-lg">
-                    <AlertTriangle className="w-7 h-7" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-rose-300 bg-rose-900/80 px-2 py-0.5 rounded">
-                      Alerte Fraude / Déjà Utilisé
-                    </span>
-                    <h4 className="text-xl font-black text-white mt-0.5 truncate">
-                      {activeBooking.passengers[0]?.firstName} {activeBooking.passengers[0]?.lastName}
-                    </h4>
-                  </div>
-                </div>
-
-                <div className="mt-3 text-xs bg-slate-900/90 p-3 rounded-xl border border-rose-800 text-rose-200 space-y-1">
-                  <p className="font-semibold text-rose-300">
-                    Ce billet a DÉJÀ été scanné et validé pour l'embarquement.
-                  </p>
-                  <p className="text-[11px] text-slate-400">
-                    Validé par : <strong className="text-slate-200">{activeBooking.boardedByAgent || 'Agent Quai'}</strong>
-                  </p>
-                  {activeBooking.boardedAt && (
-                    <p className="text-[11px] text-slate-400">
-                      Heure de scan : <strong className="text-slate-200">{new Date(activeBooking.boardedAt).toLocaleTimeString('fr-FR')}</strong>
-                    </p>
-                  )}
-                </div>
-
-                {wasBoardedOffline && (
-                  <div className="mt-3 flex items-center gap-2 p-2.5 rounded-xl bg-amber-950/80 border border-amber-800 text-[11px] text-amber-200">
-                    <Database className="w-4 h-4 text-amber-400 shrink-0" />
-                    <span>
-                      Validation sécurisée enregistrée en <strong>cache local (hors-ligne)</strong>. Le billet ne peut plus être réutilisé sur ce quai.
-                    </span>
-                  </div>
-                )}
-
-                <div className="mt-4 flex gap-2">
-                  <button
-                    onClick={handleResetBoarding}
-                    className="flex-1 py-2 text-xs font-bold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" />
-                    <span>Réinitialiser (Correction)</span>
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {scanStatus === 'not_found' && (
-              <div className="bg-amber-950/90 border-2 border-amber-500 rounded-2xl p-5 shadow-2xl animate-in zoom-in-95 duration-150">
-                <div className="flex items-center gap-3">
-                  <div className="w-12 h-12 rounded-full bg-amber-600 text-white flex items-center justify-center shrink-0 shadow-lg">
-                    <XCircle className="w-7 h-7" />
-                  </div>
-                  <div>
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-amber-300 bg-amber-900/80 px-2 py-0.5 rounded">
-                      Billet Introuvable
-                    </span>
-                    <h4 className="text-lg font-black text-white mt-0.5">
-                      Aucun Billet pour "{lastScannedPnr}"
-                    </h4>
-                  </div>
-                </div>
-                <p className="text-xs text-amber-200/90 mt-3 bg-slate-900/80 p-3 rounded-xl border border-amber-800">
-                  Vérifiez le code PNR ou dirigez le voyageur vers le guichet de gare pour édition ou confirmation de paiement.
-                </p>
               </div>
             )}
 

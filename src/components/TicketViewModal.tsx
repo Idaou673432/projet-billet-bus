@@ -25,10 +25,17 @@ import {
   Camera,
   Bus,
   AlertCircle,
-  MessageSquare
+  MessageSquare,
+  Image as ImageIcon
 } from 'lucide-react';
 import { simulateSendBookingConfirmationSms, SmsNotification } from '../services/smsService';
 import { SmsNotificationBanner } from './SmsNotificationBanner';
+import { TicketLandscape10x5 } from './TicketLandscape10x5';
+import { 
+  shareTicketOnWhatsApp, 
+  generateTicketLandscape10x5PDF, 
+  generateTicketLandscape10x5Image 
+} from '../utils/landscapeTicketGenerator';
 
 interface TicketViewModalProps {
   booking: Booking;
@@ -47,6 +54,9 @@ export const TicketViewModal: React.FC<TicketViewModalProps> = ({
   const [copied, setCopied] = useState<boolean>(false);
   const [isGeneratingPdf, setIsGeneratingPdf] = useState<boolean>(false);
   const [pdfSuccess, setPdfSuccess] = useState<boolean>(false);
+  // Default to landscape 10x5 cm for simple WhatsApp layout
+  const [ticketFormat, setTicketFormat] = useState<'landscape_10x5' | 'standard_a4'>('landscape_10x5');
+  const [isGeneratingLandscapeImg, setIsGeneratingLandscapeImg] = useState<boolean>(false);
 
   // Email sending modal state
   const [showEmailModal, setShowEmailModal] = useState<boolean>(false);
@@ -107,12 +117,17 @@ export const TicketViewModal: React.FC<TicketViewModalProps> = ({
   const passengersNames = booking.passengers.map((p) => `${p.firstName} ${p.lastName}`).join(', ');
   const seatsList = booking.passengers.map((p) => p.seatNumber).join(', ');
 
-  // 1. Download Genuine PDF File (.pdf)
+  // 1. Download Genuine PDF File (.pdf) - Adapts to chosen format (10x5 cm Landscape or A4 Document)
   const handleDownloadPDF = async () => {
     try {
       setIsGeneratingPdf(true);
-      const { doc, fileName } = await generateTicketPDF(booking, currency);
-      doc.save(fileName);
+      if (ticketFormat === 'landscape_10x5') {
+        const { doc, fileName } = await generateTicketLandscape10x5PDF(booking, currency);
+        doc.save(fileName);
+      } else {
+        const { doc, fileName } = await generateTicketPDF(booking, currency);
+        doc.save(fileName);
+      }
       setIsGeneratingPdf(false);
       setPdfSuccess(true);
       setTimeout(() => setPdfSuccess(false), 3000);
@@ -122,40 +137,30 @@ export const TicketViewModal: React.FC<TicketViewModalProps> = ({
     }
   };
 
-  // 2. Share by WhatsApp
+  // 2. Share by WhatsApp (Optimized Format Paysage 10×5 cm)
   const handleShareWhatsApp = async () => {
-    const text = `🚌 *BILLET OFFICIEL DE CAR — AFRIWAY*\n\n` +
-      `🏢 *Compagnie* : ${booking.trip.companyName}\n` +
-      `📋 *Réf Dossier (PNR)* : ${booking.pnr}\n` +
-      `👤 *Voyageur(s)* : ${passengersNames}\n` +
-      `💺 *Place(s)* : ${seatsList}\n` +
-      `📍 *Trajet* : ${booking.trip.originCity} ➔ ${booking.trip.destinationCity}\n` +
-      `🕒 *Départ* : ${booking.trip.departureDate} à ${booking.trip.departureTime}\n` +
-      `⚠️ *Convocation en gare* : ${convocationTime} (30 min avant)\n` +
-      `🏢 *Gare de départ* : ${booking.trip.originStationName}\n` +
-      `💳 *Montant réglé* : ${formatPrice(booking.totalAmountXOF, currency)} via ${booking.paymentProvider.toUpperCase()}\n` +
-      `🧳 *Bagages* : 25 kg en soute + 7 kg en cabine inclus\n\n` +
-      `📲 *Télécharger le billet PDF & QR Code* : ${window.location.href}`;
+    setTicketFormat('landscape_10x5');
+    await shareTicketOnWhatsApp(booking, currency);
+  };
 
-    if (navigator.share) {
-      try {
-        const { blob, fileName } = await generateTicketPDF(booking, currency);
-        const file = new File([blob], fileName, { type: 'application/pdf' });
-        if (navigator.canShare && navigator.canShare({ files: [file] })) {
-          await navigator.share({
-            files: [file],
-            title: `Billet AFRIWAY ${booking.pnr} - ${booking.trip.companyName}`,
-            text,
-          });
-          return;
-        }
-      } catch (e) {
-        // Fallback to URL
-      }
+  // 2b. Download Landscape PNG Image (10×5 cm, ratio 2:1 for WhatsApp)
+  const handleDownloadLandscapeImage = async () => {
+    try {
+      setIsGeneratingLandscapeImg(true);
+      const { dataUrl, fileName } = await generateTicketLandscape10x5Image(booking, currency);
+      const link = document.createElement('a');
+      link.href = dataUrl;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setIsGeneratingLandscapeImg(false);
+      setPdfSuccess(true);
+      setTimeout(() => setPdfSuccess(false), 3000);
+    } catch (err) {
+      console.error('Failed to download landscape image:', err);
+      setIsGeneratingLandscapeImg(false);
     }
-
-    const url = `https://api.whatsapp.com/send?text=${encodeURIComponent(text)}`;
-    window.open(url, '_blank');
   };
 
   // 3. Share by Snapchat
@@ -248,7 +253,7 @@ export const TicketViewModal: React.FC<TicketViewModalProps> = ({
                   ? 'bg-emerald-700 text-white' 
                   : 'bg-emerald-800 hover:bg-emerald-900 text-white'
               }`}
-              title="Télécharger le fichier PDF officiel avec logo compagnie"
+              title={ticketFormat === 'landscape_10x5' ? "Télécharger le PDF Paysage 10×5 cm" : "Télécharger le PDF A4"}
             >
               {isGeneratingPdf ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -257,17 +262,32 @@ export const TicketViewModal: React.FC<TicketViewModalProps> = ({
               ) : (
                 <FileDown className="w-3.5 h-3.5" />
               )}
-              <span>{pdfSuccess ? 'PDF Téléchargé !' : 'Télécharger PDF'}</span>
+              <span>{pdfSuccess ? 'Téléchargé !' : ticketFormat === 'landscape_10x5' ? 'PDF (10×5 cm)' : 'Télécharger PDF'}</span>
             </button>
 
-            {/* WhatsApp Share */}
+            {/* WhatsApp Share Button (Forces 10x5 cm Landscape) */}
             <button
               onClick={handleShareWhatsApp}
-              className="px-3 py-1.5 text-xs font-bold bg-[#25D366] hover:bg-[#20ba59] text-white rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow-xs"
-              title="Envoyer le billet par WhatsApp"
+              className="px-3 py-1.5 text-xs font-black bg-[#25D366] hover:bg-[#20ba59] text-white rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow-xs"
+              title="Envoyer le billet format paysage 10×5 cm par WhatsApp"
             >
               <MessageCircle className="w-3.5 h-3.5" />
-              <span>WhatsApp</span>
+              <span>WhatsApp (10×5 cm)</span>
+            </button>
+
+            {/* 10x5 cm Image Button */}
+            <button
+              onClick={handleDownloadLandscapeImage}
+              disabled={isGeneratingLandscapeImg}
+              className="px-3 py-1.5 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow-xs"
+              title="Télécharger l'image PNG 10×5 cm pour WhatsApp"
+            >
+              {isGeneratingLandscapeImg ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
+              ) : (
+                <ImageIcon className="w-3.5 h-3.5 text-amber-400" />
+              )}
+              <span>Image (10×5 cm)</span>
             </button>
 
             {/* Snapchat Share */}
@@ -305,7 +325,7 @@ export const TicketViewModal: React.FC<TicketViewModalProps> = ({
             <button
               onClick={handlePrint}
               className="px-3 py-1.5 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow-xs"
-              title="Imprimer le billet au format papier / reçu de voyage"
+              title="Imprimer le billet"
             >
               <Printer className="w-3.5 h-3.5" />
               <span>Imprimer</span>
@@ -320,16 +340,66 @@ export const TicketViewModal: React.FC<TicketViewModalProps> = ({
           </div>
         </div>
 
-        {/* Success toast if PDF just downloaded */}
+        {/* Success toast if PDF / Image just downloaded */}
         {pdfSuccess && (
           <div className="no-print bg-emerald-100 text-emerald-950 px-6 py-2 text-xs font-medium border-b border-emerald-200 flex items-center gap-2">
             <Check className="w-4 h-4 text-emerald-700" />
-            <span>Fichier PDF officiel avec le logo de <strong>{booking.trip.companyName}</strong> téléchargé avec succès !</span>
+            <span>Document de voyage officiel avec le logo de <strong>{booking.trip.companyName}</strong> généré avec succès !</span>
           </div>
         )}
 
-        {/* ----------------- BOARDING PASS MAIN CONTAINER (Printed & Viewed) ----------------- */}
-        <div ref={ticketRef} className="p-4 sm:p-7 space-y-6 max-h-[82vh] overflow-y-auto bg-slate-50/50">
+        {/* Format Selector Bar: Paysage 10x5 cm (WhatsApp) vs Document A4 */}
+        <div className="no-print bg-slate-100 px-4 sm:px-6 py-2.5 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 p-1 bg-white rounded-xl border border-slate-200 shadow-2xs">
+            <button
+              onClick={() => setTicketFormat('landscape_10x5')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-black transition-all cursor-pointer flex items-center gap-1.5 ${
+                ticketFormat === 'landscape_10x5'
+                  ? 'bg-emerald-800 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+              }`}
+            >
+              <MessageCircle className="w-3.5 h-3.5 text-[#25D366]" />
+              <span>Format Paysage WhatsApp (10 × 5 cm)</span>
+              <span className="px-1.5 py-0.2 rounded text-[9px] bg-amber-400 text-slate-950 font-black uppercase">
+                WhatsApp
+              </span>
+            </button>
+
+            <button
+              onClick={() => setTicketFormat('standard_a4')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                ticketFormat === 'standard_a4'
+                  ? 'bg-emerald-800 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+              }`}
+            >
+              <Printer className="w-3.5 h-3.5 text-slate-400" />
+              <span>Format Document A4</span>
+            </button>
+          </div>
+
+          <div className="text-[11px] font-semibold text-slate-500">
+            {ticketFormat === 'landscape_10x5'
+              ? '📐 Mesure 10 × 5 cm (Paysage) : Simple, compact et optimisé WhatsApp'
+              : '📄 Document contractuel A4 pleine page'}
+          </div>
+        </div>
+
+        {/* ======================================================== */}
+        {/* TICKET DISPLAY: 10×5 CM LANDSCAPE OR FULL A4 DOCUMENT    */}
+        {/* ======================================================== */}
+        {ticketFormat === 'landscape_10x5' ? (
+          <div className="p-4 sm:p-7 max-h-[82vh] overflow-y-auto bg-slate-50/70">
+            <TicketLandscape10x5 
+              booking={booking} 
+              currency={currency} 
+              showActionButtons={true} 
+            />
+          </div>
+        ) : (
+          /* ----------------- BOARDING PASS MAIN CONTAINER (A4 FORMAT) ----------------- */
+          <div ref={ticketRef} className="p-4 sm:p-7 space-y-6 max-h-[82vh] overflow-y-auto bg-slate-50/50">
           
           {/* Outer Boarding Pass Card */}
           <div className="bg-white rounded-3xl border-2 border-slate-300 shadow-sm overflow-hidden">
@@ -651,6 +721,7 @@ export const TicketViewModal: React.FC<TicketViewModalProps> = ({
             </div>
           </div>
         </div>
+        )}
 
         {/* Quick Conductor Inspection shortcut (Hidden when printing) */}
         {onOpenScanner && (
